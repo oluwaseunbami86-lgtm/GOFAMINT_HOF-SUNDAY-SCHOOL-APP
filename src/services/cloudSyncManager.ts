@@ -65,8 +65,13 @@ import {
   getAllFromStore,
   putInStore,
   deleteFromStore,
-  getDB
+  getDB,
+  replaceStoreContents,
+  retryFailedCloudPushes,
+  getPendingCloudSyncFailures,
+  FIRESTORE_STORE_MAP
 } from '../db/indexedDB';
+import { fetchCollection } from './firestoreDatabase';
 import {
   ClassProfile,
   Member,
@@ -261,4 +266,100 @@ export async function seedCloudFromLocalIfEmpty(): Promise<void> {
   } finally {
     isSyncingToCloud = false;
   }
+}
+
+// -------------------------------------------------------------------------
+// CLOUD -> LOCAL HYDRATION (the actual cross-device sync fix)
+// -------------------------------------------------------------------------
+// Previously the app only ever pushed local IndexedDB writes up to Firestore
+// (fire-and-forget) and read exclusively from local IndexedDB on every screen.
+// Nothing ever pulled Firestore's contents back down into IndexedDB, so a
+// second device's local cache never learned about changes made on a first
+// device. Firestore was being used as a one-way backup, not as the shared
+// source of truth every device reads from.
+//
+// hydrateLocalFromCloud() closes that loop: it fetches every collection from
+// the central Firestore database and replaces the matching local IndexedDB
+// store's contents with it, so the next read (loadAppData / loadClassQuarterData
+// in App.tsx) reflects whatever the current authoritative state is — including
+// records created, edited, or deleted from ANY device.
+//
+// Stores that map 1:1 onto a Firestore collection are fully replaced (this also
+// correctly propagates deletions made elsewhere). `classProfile` (the single
+// "currently open" class on this device) and `departments` (stored as a
+// differently-shaped local record) need small adapters, handled below.
+let isHydrating = false;
+let lastHydrationError: string | null = null;
+
+const DIRECT_REPLACE_STORES = Object.keys(FIRESTORE_STORE_MAP).filter(
+  (storeName) => !['classProfile', 'allClasses', 'departments'].includes(storeName)
+);
+
+export function getLastHydrationError(): string | null {
+  return lastHydrationError;
+}
+
+export async function hydrateLocalFromCloud(): Promise<{ ok: boolean; error?: string }> {
+  if (isHydrating) return { ok: true };
+  isHydrating = true;
+  try {
+    // Straightforward collections: members, grades, offerings, absenceLogs,
+    // referrals, adminProfiles, sundaySchoolYear, workers, workerAttendance,
+    // workerPrepAttendance, clockInConfig, workerCategories, specialEvents,
+    // specialEventAttendance, adminComments, treasuryExpenditures, lessons.
+    for (const storeName of DIRECT_REPLACE_STORES) {
+      const collectionName = FIRESTORE_STORE_MAP[storeName];
+      const cloudItems = await fetchCollection<any>(collectionName);
+      await replaceStoreContents(storeName, cloudItems);
+    }
+
+    // Classes: hydrate the full directory, then refresh whichever class is
+    // currently open on this device (without changing the selection itself —
+    // "which class is open on this device" is local UI state, not business data).
+    const cloudClasses = await fetchCollection<any>('classes');
+    await replaceStoreContents('allClasses', cloudClasses);
+    const existingProfiles = await getAllFromStore<any>('classProfile');
+    const currentId = existingProfiles[0]?.id;
+    if (currentId) {
+      const matching = cloudClasses.find((c) => c.id === currentId);
+      if (matching) {
+        await replaceStoreContents('classProfile', [matching]);
+      }
+      // If the currently-open class was deleted from another device, we
+      // deliberately leave the local copy in place rather than silently
+      // clearing the screen — the existing UI's delete/switch-class flows
+      // handle that case explicitly.
+    }
+
+    // Departments: Firestore stores {id, name} docs; the local store's keyPath
+    // is `name`.
+    const cloudDepartments = await fetchCollection<{ id: string; name: string }>('departments');
+    await replaceStoreContents(
+      'departments',
+      cloudDepartments.map((d) => ({ name: d.name || d.id }))
+    );
+
+    lastHydrationError = null;
+    return { ok: true };
+  } catch (err: any) {
+    const message = err?.message || 'Unknown cloud sync error';
+    console.error('[cloud hydration] failed:', err);
+    lastHydrationError = message;
+    return { ok: false, error: message };
+  } finally {
+    isHydrating = false;
+  }
+}
+
+// One full sync cycle: retry anything that failed to push earlier, seed the
+// cloud on very first run, then pull the latest cloud state down locally.
+// Safe to call repeatedly (on load, on window focus, on an interval, after
+// every mutating action) — every step is idempotent / a no-op when there's
+// nothing to do.
+export async function runFullCloudSyncCycle(): Promise<{ ok: boolean; error?: string; pendingRetries: number }> {
+  await retryFailedCloudPushes().catch((err) => console.warn('[cloud sync] retry pass failed:', err));
+  await seedCloudFromLocalIfEmpty();
+  const result = await hydrateLocalFromCloud();
+  const pending = await getPendingCloudSyncFailures().catch(() => []);
+  return { ...result, pendingRetries: pending.length };
 }

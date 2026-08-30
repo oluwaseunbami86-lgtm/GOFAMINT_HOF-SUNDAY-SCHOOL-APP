@@ -47,7 +47,7 @@ import {
 import { GOFAMINT_HOF_12_LESSONS } from './data/mockQuarterLessons';
 import { pushSyncToServer, pullSyncFromServer } from './services/api';
 import { getConsecutiveAbsences, getConsecutiveVisits } from './utils/calculations';
-import { seedCloudFromLocalIfEmpty } from './services/cloudSyncManager';
+import { runFullCloudSyncCycle, getLastHydrationError } from './services/cloudSyncManager';
 import { subscribeToClassGrades, subscribeToClassMembers } from './services/firestoreDatabase';
 
 // Subcomponents
@@ -160,37 +160,44 @@ export default function App() {
     }
   };
 
-  // Initialize IndexedDB and load or seed data
+  // Re-reads every top-level data slice from local IndexedDB into React state.
+  // Used both on first load and after pulling fresh data down from Cloud
+  // Firestore (see syncWithCloud below), so the screen reflects whatever is
+  // currently the authoritative state — including changes made on other devices.
+  const refreshStateFromLocalDB = async () => {
+    const profile = await getClassProfile();
+    const loadedQueue = await getSyncQueue();
+    const loadedLessons = await getAllLessons();
+    const loadedComments = await getAllAdminComments();
+    const loadedYear = await getSundaySchoolYear();
+
+    setClassProfile(profile);
+    setSyncQueue(loadedQueue);
+    setLessons(loadedLessons);
+    setComments(loadedComments);
+    setSundaySchoolYear(loadedYear);
+
+    const activeQ = loadedYear?.activeQuarterNumber || profile?.quarter || 1;
+    setSelectedQuarter(activeQ);
+
+    if (profile) {
+      await loadClassQuarterData(profile.id, activeQ);
+    } else {
+      setMembers([]);
+      setGrades([]);
+      setOfferings([]);
+      setAbsenceLogs([]);
+    }
+
+    return profile;
+  };
+
+  // Initialize IndexedDB and load whatever is in the local cache immediately
+  // (works instantly, even offline, even before Firebase Auth has resolved).
   const loadAppData = async () => {
     try {
       await initDB();
-
-      // Trigger asynchronous background cloud hydration
-      seedCloudFromLocalIfEmpty().catch(e => console.warn('Cloud sync error:', e));
-
-      const profile = await getClassProfile();
-      const loadedQueue = await getSyncQueue();
-      const loadedLessons = await getAllLessons();
-      const loadedComments = await getAllAdminComments();
-      const loadedYear = await getSundaySchoolYear();
-
-      setClassProfile(profile);
-      setSyncQueue(loadedQueue);
-      setLessons(loadedLessons);
-      setComments(loadedComments);
-      setSundaySchoolYear(loadedYear);
-
-      const activeQ = loadedYear?.activeQuarterNumber || profile?.quarter || 1;
-      setSelectedQuarter(activeQ);
-
-      if (profile) {
-        await loadClassQuarterData(profile.id, activeQ);
-      } else {
-        setMembers([]);
-        setGrades([]);
-        setOfferings([]);
-        setAbsenceLogs([]);
-      }
+      const profile = await refreshStateFromLocalDB();
 
       // Check unlock status in session
       const sessionUnlocked = sessionStorage.getItem('gofamint_unlocked');
@@ -211,6 +218,66 @@ export default function App() {
   useEffect(() => {
     loadAppData();
   }, []);
+
+  // THE CROSS-DEVICE SYNC FIX: pulls the latest data down from the central
+  // Cloud Firestore database and refreshes the screen with it. Firestore's
+  // security rules require an authenticated user, so this only runs once
+  // Firebase Auth has confirmed a signed-in user (cloudUser).
+  const syncWithCloud = async (silent = true) => {
+    if (!cloudUser) return;
+    if (!silent) {
+      setIsSyncing(true);
+      setSyncStatusText('Syncing with central database…');
+    }
+    try {
+      const result = await runFullCloudSyncCycle();
+      await refreshStateFromLocalDB();
+      if (result.ok) {
+        setSyncStatusText(
+          result.pendingRetries > 0
+            ? `Synced — ${result.pendingRetries} change(s) still waiting to reach the cloud`
+            : 'Synced with central database'
+        );
+      } else {
+        setSyncStatusText(`Cloud sync issue: ${result.error || getLastHydrationError() || 'unknown error'}`);
+      }
+    } catch (err: any) {
+      console.error('Cloud sync cycle failed:', err);
+      setSyncStatusText(`Cloud sync issue: ${err?.message || 'unknown error'}`);
+    } finally {
+      if (!silent) setIsSyncing(false);
+    }
+  };
+
+  // Run an initial cloud sync as soon as we know who's signed in, then keep the
+  // local cache fresh with a light poll while the tab is open/focused and
+  // whenever the browser regains connectivity. No WebSockets/real-time
+  // infrastructure needed — every device just periodically re-reads the shared
+  // central database, which is enough to guarantee "create on Device A, see it
+  // on Device B after a refresh" (and, in practice, usually much sooner).
+  useEffect(() => {
+    if (!cloudUser) return;
+
+    syncWithCloud(true);
+
+    const interval = window.setInterval(() => syncWithCloud(true), 45000);
+    const handleFocus = () => syncWithCloud(true);
+    const handleOnlineReconnect = () => syncWithCloud(true);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') syncWithCloud(true);
+    };
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('online', handleOnlineReconnect);
+    document.addEventListener('visibilitychange', handleVisibility);
+
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('online', handleOnlineReconnect);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cloudUser]);
 
   // Compute status for selected quarter
   const selectedQuarterStatus: QuarterStatus = useMemo(() => {
@@ -703,6 +770,10 @@ export default function App() {
     } finally {
       setIsSyncing(false);
     }
+    // Always also retry/flush anything pending to the CENTRAL Firestore database —
+    // this is the sync path that actually reaches every other device, regardless
+    // of whether the optional local-network Host Server above was reachable.
+    await syncWithCloud(false);
   };
 
   const handlePullSync = async () => {
@@ -741,6 +812,10 @@ export default function App() {
     } finally {
       setIsSyncing(false);
     }
+    // Always also pull the latest state from the CENTRAL Firestore database —
+    // this is what actually picks up changes made on other devices, regardless
+    // of whether the optional local-network Host Server above was reachable.
+    await syncWithCloud(false);
   };
 
   // Full Backup Import

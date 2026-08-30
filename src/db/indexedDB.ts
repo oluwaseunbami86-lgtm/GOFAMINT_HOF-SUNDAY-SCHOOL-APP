@@ -12,10 +12,54 @@ import {
 } from '../services/firestoreDatabase';
 
 // Fire-and-forget cloud push: local (IndexedDB) writes always succeed first so the
-// app keeps working offline; this mirrors the write to Firestore in the background
-// and just logs a warning if it fails (e.g. offline, or not signed in yet).
-function pushToCloud<T>(label: string, fn: () => Promise<T>): void {
-  fn().catch((err) => console.warn(`[cloud sync] ${label} failed:`, err?.message || err));
+// app keeps working offline; this mirrors the write to Firestore in the background.
+// If the push fails (offline, transient error, etc.) it is NOT silently dropped —
+// it's persisted to the `cloudSyncFailures` store and retried automatically (see
+// retryFailedCloudPushes(), invoked on reconnect / periodic sync / app focus in
+// cloudSyncManager.ts). This is what guarantees a change made on one device is
+// never lost before it reaches the central Firestore database that other devices
+// read from.
+export interface CloudSyncFailureRecord {
+  id: string;
+  label: string;
+  collectionName: string;
+  action: 'save' | 'delete';
+  docId: string;
+  data?: any;
+  failedAt: string;
+  lastError?: string;
+}
+
+function pushToCloud<T>(
+  label: string,
+  fn: () => Promise<T>,
+  retryMeta?: { collectionName: string; action: 'save' | 'delete'; docId: string; data?: any }
+): void {
+  fn().catch(async (err) => {
+    console.warn(`[cloud sync] ${label} failed:`, err?.message || err);
+    if (!retryMeta) return;
+    try {
+      const record: CloudSyncFailureRecord = {
+        id: `${retryMeta.collectionName}_${retryMeta.docId}_${retryMeta.action}`,
+        label,
+        collectionName: retryMeta.collectionName,
+        action: retryMeta.action,
+        docId: retryMeta.docId,
+        data: retryMeta.data,
+        failedAt: new Date().toISOString(),
+        lastError: err?.message || String(err)
+      };
+      const db = await getDB();
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction('cloudSyncFailures', 'readwrite');
+        tx.objectStore('cloudSyncFailures').put(record);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (queueErr) {
+      console.warn('[cloud sync] failed to queue retry record:', queueErr);
+    }
+  });
 }
 
 import {
@@ -68,7 +112,10 @@ import {
 } from '../services/firestoreDatabase';
 
 const DB_NAME = 'GOFAMINT_HOF_SundaySchool_DB';
-const DB_VERSION = 6;
+// v7: added `cloudSyncFailures` store — persists Cloud Firestore writes that failed
+// (e.g. while offline) so they can be retried instead of being silently dropped,
+// and added the cross-device cloud hydration pipeline (see cloudSyncManager.ts).
+const DB_VERSION = 7;
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -167,6 +214,12 @@ export function getDB(): Promise<IDBDatabase> {
           const eStore = db.createObjectStore('treasuryExpenditures', { keyPath: 'id' });
           eStore.createIndex('date', 'date', { unique: false });
         }
+        if (!db.objectStoreNames.contains('cloudSyncFailures')) {
+          // Persisted queue of Cloud Firestore writes that failed (e.g. offline, or a
+          // rejected write). Retried automatically once connectivity is restored so a
+          // failed write is never silently lost — see retryFailedCloudPushes().
+          db.createObjectStore('cloudSyncFailures', { keyPath: 'id' });
+        }
       };
 
       request.onsuccess = (event) => {
@@ -201,8 +254,10 @@ export async function getAllFromStore<T>(storeName: string): Promise<T[]> {
   }
 }
 
-// Map of local store names to Firestore collection names
-const FIRESTORE_STORE_MAP: Record<string, string> = {
+// Map of local store names to Firestore collection names. Exported so
+// cloudSyncManager.ts can drive the reverse direction (pulling the central
+// Firestore database down into each device's local IndexedDB cache).
+export const FIRESTORE_STORE_MAP: Record<string, string> = {
   classProfile: 'classes',
   allClasses: 'classes',
   members: 'members',
@@ -224,12 +279,17 @@ const FIRESTORE_STORE_MAP: Record<string, string> = {
   treasuryExpenditures: 'treasuryExpenditures'
 };
 
-export async function putInStore<T>(storeName: string, value: T): Promise<T> {
-  // Mirror to Cloud Firestore asynchronously
+export async function putInStore<T>(storeName: string, value: T, skipCloudMirror = false): Promise<T> {
+  // Mirror to Cloud Firestore asynchronously. `skipCloudMirror` is used when the
+  // value being written just came FROM the cloud (see hydrateLocalFromCloud in
+  // cloudSyncManager.ts) so we don't immediately write it straight back.
   const colName = FIRESTORE_STORE_MAP[storeName];
-  if (colName && (value as any)?.id) {
-    saveDocument(colName, value as any).catch(err => {
-      console.warn(`Firestore sync note [${colName}/${(value as any).id}]:`, err);
+  if (!skipCloudMirror && colName && (value as any)?.id) {
+    pushToCloud(`${colName}/${(value as any).id}`, () => saveDocument(colName, value as any), {
+      collectionName: colName,
+      action: 'save',
+      docId: (value as any).id,
+      data: value
     });
   }
 
@@ -263,8 +323,10 @@ export async function deleteFromStore(storeName: string, id: string): Promise<vo
   // Mirror deletion to Cloud Firestore asynchronously
   const colName = FIRESTORE_STORE_MAP[storeName];
   if (colName && id) {
-    removeDocument(colName, id).catch(err => {
-      console.warn(`Firestore deletion sync note [${colName}/${id}]:`, err);
+    pushToCloud(`delete ${colName}/${id}`, () => removeDocument(colName, id), {
+      collectionName: colName,
+      action: 'delete',
+      docId: id
     });
   }
 
@@ -291,6 +353,69 @@ export async function deleteFromStore(storeName: string, id: string): Promise<vo
   } catch (e) {
     console.warn(`localStorage delete sync error:`, e);
   }
+}
+
+// Replaces the ENTIRE contents of a local IndexedDB store with `items`, without
+// mirroring anything back to Cloud Firestore. This is the primitive used to pull
+// the central Firestore database down into a device's local cache (cloud is
+// authoritative, so this also correctly removes local records that were deleted
+// on another device). See hydrateLocalFromCloud() in cloudSyncManager.ts.
+export async function replaceStoreContents<T>(storeName: string, items: T[]): Promise<void> {
+  const db = await getDB();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    const store = tx.objectStore(storeName);
+    store.clear();
+    for (const item of items) store.put(item);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  try {
+    localStorage.setItem(`gofamint_${storeName}`, JSON.stringify(items));
+  } catch {
+    // Non-fatal — localStorage is only used here as an IndexedDB-unavailable fallback mirror.
+  }
+}
+
+// Returns any Cloud Firestore writes that previously failed and are still pending retry.
+export async function getPendingCloudSyncFailures(): Promise<CloudSyncFailureRecord[]> {
+  try {
+    return await getAllFromStore<CloudSyncFailureRecord>('cloudSyncFailures');
+  } catch {
+    return [];
+  }
+}
+
+// Retries every queued failed Cloud Firestore write. Successful retries are removed
+// from the queue; writes that fail again stay queued (with the latest error) for the
+// next retry pass. Called on reconnect / periodic sync / app focus.
+export async function retryFailedCloudPushes(): Promise<{ retried: number; succeeded: number }> {
+  const pending = await getPendingCloudSyncFailures();
+  let succeeded = 0;
+  for (const record of pending) {
+    try {
+      if (record.action === 'save') {
+        await saveDocument(record.collectionName, record.data);
+      } else {
+        await removeDocument(record.collectionName, record.docId);
+      }
+      await deleteFromStore('cloudSyncFailures', record.id).catch(() => {});
+      // deleteFromStore also tries to mirror this deletion to a (non-existent)
+      // Firestore collection named 'cloudSyncFailures' via FIRESTORE_STORE_MAP,
+      // which is a harmless no-op since that store isn't in the map.
+      succeeded++;
+    } catch (err: any) {
+      console.warn(`[cloud sync] retry failed for ${record.label}:`, err?.message || err);
+      try {
+        const db = await getDB();
+        const tx = db.transaction('cloudSyncFailures', 'readwrite');
+        tx.objectStore('cloudSyncFailures').put({ ...record, lastError: err?.message || String(err) });
+      } catch {
+        // best-effort
+      }
+    }
+  }
+  return { retried: pending.length, succeeded };
 }
 
 // Database Initialization & Clean Startup
