@@ -14,11 +14,12 @@ import { GoogleGenAI } from "@google/genai";
 import { initializeApp, getApps, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
-import firebaseConfig from "../firebase-applet-config.json";
 
 // Must match the client's firestoreDatabaseId in firebase-applet-config.json —
 // this project uses a named Firestore database, not the "(default)" one.
-const FIRESTORE_DATABASE_ID = (firebaseConfig as any).firestoreDatabaseId || undefined;
+// (Not a secret — this same ID is already shipped to every browser in the
+// client-side Firebase config, so it's safe to hardcode here.)
+const FIRESTORE_DATABASE_ID = "ai-studio-remixremixremixr-e1005fdc-a3ec-4e1c-8527-666bdea0d747";
 
 let adminApp: any = null;
 function getAdminApp() {
