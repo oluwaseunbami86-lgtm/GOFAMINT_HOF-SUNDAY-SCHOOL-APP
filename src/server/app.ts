@@ -3,7 +3,7 @@ import path from "path";
 import fs from "fs";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
-import { getAdminAuth, getAdminDb } from "./firebaseAdmin";
+import { getAdminAuth, getAdminDb } from "./firebaseAdmin.js";
 
 dotenv.config();
 
