@@ -5,7 +5,7 @@
 //
 // If you change src/server/app.ts or src/server/firebaseAdmin.ts, this file
 // needs to be regenerated to match (ask Claude to re-bundle it).
- 
+
 import express from "express";
 import path from "path";
 import fs from "fs";
@@ -14,7 +14,12 @@ import { GoogleGenAI } from "@google/genai";
 import { initializeApp, getApps, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
- 
+import firebaseConfig from "../firebase-applet-config.json";
+
+// Must match the client's firestoreDatabaseId in firebase-applet-config.json —
+// this project uses a named Firestore database, not the "(default)" one.
+const FIRESTORE_DATABASE_ID = (firebaseConfig as any).firestoreDatabaseId || undefined;
+
 let adminApp: any = null;
 function getAdminApp() {
   if (adminApp) return adminApp;
@@ -36,14 +41,16 @@ function getAdminAuth() {
   return getAuth(getAdminApp());
 }
 function getAdminDb() {
-  return getFirestore(getAdminApp());
+  return FIRESTORE_DATABASE_ID
+    ? getFirestore(getAdminApp(), FIRESTORE_DATABASE_ID)
+    : getFirestore(getAdminApp());
 }
- 
+
 dotenv.config();
 const DATA_DIR = path.join(process.cwd(), "data");
 const DB_FILE = path.join(DATA_DIR, "server_database.json");
 const isServerless = !!process.env.VERCEL;
- 
+
 function loadServerData(): any {
   if (!isServerless && fs.existsSync(DB_FILE)) {
     try {
@@ -64,7 +71,7 @@ function saveServerData(data: any) {
     console.error("Failed to persist server data file:", err);
   }
 }
- 
+
 const serverDatabase: any = loadServerData() || {
   classes: [],
   members: [],
@@ -74,16 +81,16 @@ const serverDatabase: any = loadServerData() || {
   referrals: [],
   lastSyncedAt: new Date().toISOString(),
 };
- 
+
 function createApp() {
   const app = express();
   app.use(express.json({ limit: "50mb" }));
- 
+
   const ai = new GoogleGenAI({
     apiKey: process.env.GEMINI_API_KEY || "",
     httpOptions: { headers: { "User-Agent": "aistudio-build" } },
   });
- 
+
   app.get("/api/health", (req, res) => {
     res.json({
       status: "ok",
@@ -99,7 +106,7 @@ function createApp() {
       lastSyncedAt: serverDatabase.lastSyncedAt,
     });
   });
- 
+
   app.get("/api/schema", (req, res) => {
     const schemaPath = path.join(process.cwd(), "src", "db", "schema.sql");
     if (fs.existsSync(schemaPath)) {
@@ -109,7 +116,7 @@ function createApp() {
       res.status(404).send("-- Schema file not found on server");
     }
   });
- 
+
   app.post("/api/sync/push", (req, res) => {
     try {
       const payload = req.body;
@@ -144,7 +151,7 @@ function createApp() {
       res.status(500).json({ error: err.message || "Failed to process sync push" });
     }
   });
- 
+
   app.get("/api/sync/pull", (req, res) => {
     res.json({
       classProfile: serverDatabase.classes[0] || null,
@@ -156,7 +163,7 @@ function createApp() {
       timestamp: serverDatabase.lastSyncedAt,
     });
   });
- 
+
   app.post("/api/gemini/assistant", async (req, res) => {
     try {
       const {
@@ -170,7 +177,7 @@ function createApp() {
         memoryVerseRef,
         teacherName,
       } = req.body;
- 
+
       let prompt = "";
       if (type === "WHATSAPP_FOLLOWUP") {
         prompt = `You are the Sunday School Secretary / Teacher at The Gospel Faith Mission International (House of Favour) (GOFAMINT_HOF).
@@ -181,7 +188,7 @@ Details:
 - Member Prayer Requests: ${prayerRequest || "General spiritual growth & grace"}
 - Current Sunday School Lesson Topic: "${lessonTopic || "Walking in Christ"}" (Memory Verse: ${memoryVerseRef || "Bible"}: "${memoryVerse || ""}")
 - Teacher/Secretary Name: ${teacherName || "Sunday School Department"}
- 
+
 Guidelines:
 - Keep the tone very warm, spiritual, uplifting, and not condemning.
 - Mention how deeply they were missed in class.
@@ -194,7 +201,7 @@ Details:
 - Consecutive Weeks Absent: ${weeksAbsent || "3+ weeks"}
 - Known Reasons / Notes: ${prayerRequest || "No contact yet or urgent care required"}
 - Class: ${lessonTopic || "Sunday School Class"}
- 
+
 Generate a structured, professional 1-page Pastoral Care Briefing:
 1. Executive Alert Summary
 2. Contact History & Current Status
@@ -204,7 +211,7 @@ Generate a structured, professional 1-page Pastoral Care Briefing:
 Provide dynamic teaching insights, 3 thought-provoking interactive discussion questions, and practical life applications for:
 - Lesson Topic: "${lessonTopic}"
 - Memory Verse: "${memoryVerse}" (${memoryVerseRef})
- 
+
 Provide:
 1. Core Theological Insight (2-3 sentences)
 2. 3 Interactive Class Discussion Questions (with target age relevance)
@@ -212,32 +219,32 @@ Provide:
       } else {
         prompt = `You are an AI assistant for a GOFAMINT_HOF Sunday School Secretary. Provide helpful, Christ-centered advice for Sunday school administration and discipleship. Query: ${JSON.stringify(req.body)}`;
       }
- 
+
       if (!process.env.GEMINI_API_KEY) {
         return res.json({
           text: `Dear ${memberName || "Beloved"},
- 
+
 We missed your warm presence in our GOFAMINT_HOF Sunday School class today! We studied "${lessonTopic || "The Word of God"}" (${memoryVerseRef || "Philippians 4:13"}). We prayed specifically for your requests: "${prayerRequest || "God's divine favor"}".
- 
+
 May God uphold and bless you throughout this week. We look forward to rejoicing with you next Sunday!
- 
+
 Warm regards in Christ,
 ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
         });
       }
- 
+
       const response = await ai.models.generateContent({
         model: "gemini-3.7-flash",
         contents: prompt,
       });
- 
+
       res.json({ text: response.text });
     } catch (err: any) {
       console.error("Gemini API Error:", err);
       res.status(500).json({ error: err.message || "Failed to generate AI response" });
     }
   });
- 
+
   const EXEC_ROLES = ["SUPER_ADMIN", "GENERAL_SUPERINTENDENT", "GENERAL_SECRETARY"];
   const ASSIGNABLE_ROLES = [
     "GENERAL_SUPERINTENDENT",
@@ -250,7 +257,7 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
     "CLASS_SECRETARY",
     "WORKER",
   ];
- 
+
   app.post("/api/admin/create-user", async (req, res) => {
     try {
       const authHeader = req.headers.authorization || "";
@@ -258,19 +265,19 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
       if (!idToken) {
         return res.status(401).json({ error: "Missing sign-in token." });
       }
- 
+
       const adminAuth = getAdminAuth();
       const adminDb = getAdminDb();
- 
+
       const decoded = await adminAuth.verifyIdToken(idToken);
       const callerUid = decoded.uid;
       const callerDoc = await adminDb.collection("users").doc(callerUid).get();
       const callerRole = callerDoc.exists ? callerDoc.data()?.roleType : null;
- 
+
       if (!callerRole || !EXEC_ROLES.includes(callerRole)) {
         return res.status(403).json({ error: "You do not have permission to create logins." });
       }
- 
+
       const { email, password, roleType, displayName } = req.body || {};
       if (!email || !password || !roleType) {
         return res.status(400).json({ error: "email, password, and roleType are required." });
@@ -281,13 +288,13 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
       if (!ASSIGNABLE_ROLES.includes(roleType)) {
         return res.status(400).json({ error: "Invalid role." });
       }
- 
+
       const newUser = await adminAuth.createUser({
         email: String(email).trim(),
         password,
         displayName: displayName || undefined,
       });
- 
+
       await adminDb.collection("users").doc(newUser.uid).set({
         roleType,
         email: newUser.email,
@@ -295,7 +302,7 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
         createdBy: callerUid,
         createdAt: new Date().toISOString(),
       });
- 
+
       res.json({ success: true, uid: newUser.uid, email: newUser.email, roleType });
     } catch (err: any) {
       console.error("create-user error:", err);
@@ -306,11 +313,10 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
       res.status(500).json({ error: message });
     }
   });
- 
+
   return app;
 }
- 
+
 const app = createApp();
- 
+
 export default app;
- 
