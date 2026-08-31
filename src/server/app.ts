@@ -284,11 +284,24 @@ Provide:
   // verified here against the caller's real Firestore role doc (never trusts
   // anything the browser claims), exactly like /api/admin/create-user above.
   //
-  // Scope (derived from src/types.ts / firestore.rules, not guessed):
-  //   PRESERVED — users, adminProfiles, classes, departments, workers,
-  //     workerCategories, clockInConfig (all system/config/identity data).
+  // Scope (derived from src/types.ts / firestore.rules, and confirmed with
+  // the church admin — not guessed):
+  //   PRESERVED (identity/config, never touched) — users, adminProfiles,
+  //     departments, workerCategories, clockInConfig. The class list itself
+  //     (className) and worker directory entries (fullName, phone,
+  //     qrCodeToken, status, etc.) also persist as records.
+  //   CLEARED (assignment fields only, record kept) — on every class:
+  //     secretaryName, secretaryPhone, teachers, passwordHash, and
+  //     isSetupComplete (this forces the app's own first-run setup screen
+  //     the next time the class is opened, so the incoming secretary must
+  //     choose a brand-new password — the outgoing secretary's password is
+  //     never reused); on every worker: assignedClass, duty, categories
+  //     (their current duty role). A snapshot of the pre-clear class/worker
+  //     assignments is saved to the archive first, so who held what last
+  //     year is never lost.
   //   ARCHIVED then RESET — the outgoing `sundaySchoolYear` document is
-  //     copied into `sundaySchoolYearArchive` before anything else happens.
+  //     copied into `sundaySchoolYearArchive` before anything else happens,
+  //     alongside the class/worker assignment snapshot above.
   //   RESET (cleared) — members, grades, offerings, absenceLogs, referrals,
   //     workerAttendance, workerPrepAttendance, specialEvents,
   //     specialEventAttendance, adminComments, treasuryExpenditures, lessons
@@ -297,17 +310,18 @@ Provide:
   //
   // Firestore has no single multi-thousand-document ACID transaction, so
   // atomicity is approximated deliberately in this order: (1) archive the
-  // outgoing year first — cheap and safe, guarantees history is never lost;
-  // (2) clear operational collections; (3) write the new year document;
-  // (4) only then delete the old year document, so the `sundaySchoolYear`
-  // collection is never left empty. Every step here is a no-op when re-run
-  // (deleting an already-deleted doc, re-archiving the same doc, etc.), so if
-  // a failure happens partway through, simply calling this endpoint again
-  // with the same request safely finishes the job instead of corrupting
-  // state — the practical equivalent of a rollback-and-retry for an
-  // operation this size. Every attempt (success or failure) is written to
-  // `auditLogs` before the destructive work starts and updated with the
-  // final outcome.
+  // outgoing year and current class/worker assignments first — cheap and
+  // safe, guarantees history is never lost; (2) clear operational
+  // collections; (3) clear class/worker assignment fields; (4) write the new
+  // year document; (5) only then delete the old year document, so the
+  // `sundaySchoolYear` collection is never left empty. Every step here is a
+  // no-op when re-run (deleting an already-deleted doc, re-archiving the
+  // same doc, clearing already-blank fields, etc.), so if a failure happens
+  // partway through, simply calling this endpoint again with the same
+  // request safely finishes the job instead of corrupting state — the
+  // practical equivalent of a rollback-and-retry for an operation this size.
+  // Every attempt (success or failure) is written to `auditLogs` before the
+  // destructive work starts and updated with the final outcome.
   // -----------------------------------------------------------------------
   const RESET_AUTHORIZED_ROLES = ["SUPER_ADMIN", "GENERAL_SUPERINTENDENT"];
   const YEAR_RESET_COLLECTIONS = [
@@ -344,6 +358,33 @@ Provide:
       if (snapshot.size < batchSize) break;
     }
     return totalDeleted;
+  }
+
+  // Clears specific fields on every document in a collection WITHOUT
+  // deleting the documents themselves — used for classes/workers, where the
+  // record (class login, worker profile) must survive the year reset but its
+  // year-specific assignment fields should be cleared for reassignment.
+  async function clearFieldsInCollection(
+    db: FirebaseFirestore.Firestore,
+    collectionName: string,
+    clearedFields: Record<string, any>,
+    batchSize = 450
+  ): Promise<{ updated: number; snapshot: any[] }> {
+    const collRef = db.collection(collectionName);
+    const allDocs = await collRef.get();
+    const snapshot = allDocs.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+
+    let updated = 0;
+    for (let i = 0; i < allDocs.docs.length; i += batchSize) {
+      const chunk = allDocs.docs.slice(i, i + batchSize);
+      const batch = db.batch();
+      chunk.forEach((doc) => {
+        batch.update(doc.ref, { ...clearedFields, updatedAt: new Date().toISOString() });
+      });
+      await batch.commit();
+      updated += chunk.length;
+    }
+    return { updated, snapshot };
   }
 
   app.post("/api/admin/reset-year", async (req, res) => {
@@ -406,8 +447,33 @@ Provide:
         startedAt: FieldValue.serverTimestamp(),
       });
 
-      // 1. Preserve: archive the full outgoing year record before touching
-      // anything else.
+      // 1. Preserve: archive the full outgoing year record, plus a snapshot
+      // of who currently holds each class and each worker's duty role,
+      // before touching anything else.
+      const classesSnapshotDocs = await adminDb.collection("classes").get();
+      const classAssignmentsSnapshot = classesSnapshotDocs.docs.map((d) => {
+        const c = d.data() as any;
+        return {
+          classId: d.id,
+          className: c.className,
+          secretaryName: c.secretaryName,
+          secretaryPhone: c.secretaryPhone,
+          teachers: c.teachers,
+        };
+      });
+
+      const workersSnapshotDocs = await adminDb.collection("workers").get();
+      const workerAssignmentsSnapshot = workersSnapshotDocs.docs.map((d) => {
+        const w = d.data() as any;
+        return {
+          workerId: d.id,
+          fullName: w.fullName,
+          assignedClass: w.assignedClass,
+          duty: w.duty,
+          categories: w.categories,
+        };
+      });
+
       await adminDb
         .collection("sundaySchoolYearArchive")
         .doc(currentYearDoc.id)
@@ -415,15 +481,43 @@ Provide:
           ...currentYear,
           archivedAt: FieldValue.serverTimestamp(),
           archivedBy: callerUid,
+          classAssignmentsSnapshot,
+          workerAssignmentsSnapshot,
         });
 
       // 2. Reset only year-specific operational data. Users, adminProfiles,
-      // classes, departments, workers, workerCategories, and clockInConfig
-      // are deliberately never touched by this loop.
+      // departments, workerCategories, and clockInConfig are deliberately
+      // never touched by this loop.
       const deletedCounts: Record<string, number> = {};
       for (const collectionName of YEAR_RESET_COLLECTIONS) {
         deletedCounts[collectionName] = await deleteAllDocsInCollection(adminDb, collectionName);
       }
+
+      // 2b. Clear only the YEAR ASSIGNMENT fields on classes and workers.
+      // For classes this INCLUDES the password: the outgoing secretary chose
+      // that password herself, so leaving it unchanged would let her keep
+      // logging in even after being cleared from the class. Clearing
+      // passwordHash together with isSetupComplete forces the app's existing
+      // first-run setup screen the next time anyone opens this class,
+      // requiring a brand-new secretary name, phone, and password to be set
+      // before it can be used again. (approvalStatus is left untouched —
+      // AuthModal's own setup flow already carries the existing
+      // approvalStatus forward for a class that already existed, so a
+      // previously-approved class does not need re-approval just to be
+      // reassigned.) For workers, only the duty/role assignment is cleared —
+      // there is no worker-level login to reset.
+      const classesCleared = await clearFieldsInCollection(adminDb, "classes", {
+        secretaryName: "",
+        secretaryPhone: "",
+        teachers: [],
+        passwordHash: "",
+        isSetupComplete: false,
+      });
+      const workersCleared = await clearFieldsInCollection(adminDb, "workers", {
+        assignedClass: "",
+        duty: "",
+        categories: [],
+      });
 
       // 3. Write the new year document BEFORE removing the old one, so the
       // singleton `sundaySchoolYear` collection is never briefly empty.
@@ -466,12 +560,21 @@ Provide:
           newYearId,
           newYearName: newYearDoc.yearName,
           deletedCounts,
+          classesReassigned: classesCleared.updated,
+          workersReassigned: workersCleared.updated,
           completedAt: FieldValue.serverTimestamp(),
         },
         { merge: true }
       );
 
-      res.json({ success: true, newYearId, newYearName: newYearDoc.yearName, deletedCounts });
+      res.json({
+        success: true,
+        newYearId,
+        newYearName: newYearDoc.yearName,
+        deletedCounts,
+        classesReassigned: classesCleared.updated,
+        workersReassigned: workersCleared.updated,
+      });
     } catch (err: any) {
       console.error("reset-year error:", err);
       if (auditRef) {
