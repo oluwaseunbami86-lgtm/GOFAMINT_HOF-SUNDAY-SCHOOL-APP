@@ -318,10 +318,19 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
   // -----------------------------------------------------------------------
   // Admin: Reset / "Start New Year" — kept in sync with the same endpoint in
   // src/server/app.ts (see the comment there for the full rationale). Scope:
-  //   PRESERVED — users, adminProfiles, classes, departments, workers,
-  //     workerCategories, clockInConfig.
+  //   PRESERVED (identity/config, never touched) — users, adminProfiles,
+  //     departments, workerCategories, clockInConfig. The class list itself
+  //     (className) and worker directory entries (fullName, phone,
+  //     qrCodeToken, status, etc.) also persist as records.
+  //   CLEARED (assignment fields only, record kept) — on every class:
+  //     secretaryName, secretaryPhone, teachers, passwordHash, and
+  //     isSetupComplete (forces the first-run setup screen next time the
+  //     class is opened, so a brand-new password must be set — the outgoing
+  //     secretary's password is never reused); on every worker:
+  //     assignedClass, duty, categories. Snapshotted to the archive first.
   //   ARCHIVED then RESET — sundaySchoolYear (copied to
-  //     sundaySchoolYearArchive before the current doc is replaced).
+  //     sundaySchoolYearArchive, along with the class/worker assignment
+  //     snapshot, before the current doc is replaced).
   //   RESET (cleared) — members, grades, offerings, absenceLogs, referrals,
   //     workerAttendance, workerPrepAttendance, specialEvents,
   //     specialEventAttendance, adminComments, treasuryExpenditures, lessons.
@@ -355,6 +364,30 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
       if (snapshot.size < batchSize) break;
     }
     return totalDeleted;
+  }
+
+  // Clears specific fields on every document in a collection WITHOUT
+  // deleting the documents themselves — used for classes/workers, where the
+  // record (class login, worker profile) must survive the year reset but its
+  // year-specific assignment fields should be cleared for reassignment.
+  async function clearFieldsInCollection(
+    db: any,
+    collectionName: string,
+    clearedFields: Record<string, any>,
+    batchSize = 450
+  ): Promise<{ updated: number }> {
+    const allDocs = await db.collection(collectionName).get();
+    let updated = 0;
+    for (let i = 0; i < allDocs.docs.length; i += batchSize) {
+      const chunk = allDocs.docs.slice(i, i + batchSize);
+      const batch = db.batch();
+      chunk.forEach((doc: any) => {
+        batch.update(doc.ref, { ...clearedFields, updatedAt: new Date().toISOString() });
+      });
+      await batch.commit();
+      updated += chunk.length;
+    }
+    return { updated };
   }
 
   app.post("/api/admin/reset-year", async (req, res) => {
@@ -413,6 +446,33 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
         startedAt: FieldValue.serverTimestamp(),
       });
 
+      // 1. Preserve: archive the full outgoing year record, plus a snapshot
+      // of who currently holds each class and each worker's duty role,
+      // before touching anything else.
+      const classesSnapshotDocs = await adminDb.collection("classes").get();
+      const classAssignmentsSnapshot = classesSnapshotDocs.docs.map((d: any) => {
+        const c = d.data();
+        return {
+          classId: d.id,
+          className: c.className,
+          secretaryName: c.secretaryName,
+          secretaryPhone: c.secretaryPhone,
+          teachers: c.teachers,
+        };
+      });
+
+      const workersSnapshotDocs = await adminDb.collection("workers").get();
+      const workerAssignmentsSnapshot = workersSnapshotDocs.docs.map((d: any) => {
+        const w = d.data();
+        return {
+          workerId: d.id,
+          fullName: w.fullName,
+          assignedClass: w.assignedClass,
+          duty: w.duty,
+          categories: w.categories,
+        };
+      });
+
       await adminDb
         .collection("sundaySchoolYearArchive")
         .doc(currentYearDoc.id)
@@ -420,12 +480,34 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
           ...currentYear,
           archivedAt: FieldValue.serverTimestamp(),
           archivedBy: callerUid,
+          classAssignmentsSnapshot,
+          workerAssignmentsSnapshot,
         });
 
+      // 2. Reset only year-specific operational data. Users, adminProfiles,
+      // departments, workerCategories, and clockInConfig are deliberately
+      // never touched by this loop.
       const deletedCounts: Record<string, number> = {};
       for (const collectionName of YEAR_RESET_COLLECTIONS) {
         deletedCounts[collectionName] = await deleteAllDocsInCollection(adminDb, collectionName);
       }
+
+      // 2b. Clear only the YEAR ASSIGNMENT fields on classes and workers —
+      // the class login and the worker's directory record both survive
+      // untouched, ready to be reassigned to whoever holds the role this
+      // year.
+      const classesCleared = await clearFieldsInCollection(adminDb, "classes", {
+        secretaryName: "",
+        secretaryPhone: "",
+        teachers: [],
+        passwordHash: "",
+        isSetupComplete: false,
+      });
+      const workersCleared = await clearFieldsInCollection(adminDb, "workers", {
+        assignedClass: "",
+        duty: "",
+        categories: [],
+      });
 
       const newYearId = `YEAR_${Date.now()}`;
       const quarterNames = ["First Quarter", "Second Quarter", "Third Quarter", "Fourth Quarter"];
@@ -464,12 +546,21 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
           newYearId,
           newYearName: newYearDoc.yearName,
           deletedCounts,
+          classesReassigned: classesCleared.updated,
+          workersReassigned: workersCleared.updated,
           completedAt: FieldValue.serverTimestamp(),
         },
         { merge: true }
       );
 
-      res.json({ success: true, newYearId, newYearName: newYearDoc.yearName, deletedCounts });
+      res.json({
+        success: true,
+        newYearId,
+        newYearName: newYearDoc.yearName,
+        deletedCounts,
+        classesReassigned: classesCleared.updated,
+        workersReassigned: workersCleared.updated,
+      });
     } catch (err: any) {
       console.error("reset-year error:", err);
       if (auditRef) {

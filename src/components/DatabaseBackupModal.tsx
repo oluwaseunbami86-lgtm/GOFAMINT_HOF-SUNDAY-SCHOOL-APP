@@ -453,7 +453,7 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
       setResetProgressPct(100);
       setResetStepText('✅ New year started!');
       setResetSuccess(
-        `"${result.newYearName}" is now the active Sunday School year. The previous year's records have been safely archived and cleared from every device — users, roles, classes, workers, and departments were not affected.`
+        `"${result.newYearName}" is now the active Sunday School year. The previous year's records have been safely archived and cleared from every device. ${result.classesReassigned || 0} class(es) have had their secretary, teachers, and password cleared — each will be asked to set up fresh when next opened. ${result.workersReassigned || 0} worker(s) have had their duty assignments cleared and are ready to be reassigned. Users, roles, the worker directory, and the class list itself were not affected — use the Workers Directory separately to add new workers or remove departing ones.`
       );
 
       playSuccessSound();
@@ -1138,15 +1138,17 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
                       <li>Worker Sunday & preparatory-class attendance</li>
                       <li>Special events and their attendance</li>
                       <li>Treasury expenditures and the lesson curriculum</li>
+                      <li>Which secretary & teachers are on each class, AND that class's password — the next person to open the class will be asked to set up a brand-new password (the outgoing secretary's password stops working)</li>
+                      <li>Each worker's assigned class, duty, and category roles (cleared for reassignment — their directory profile stays, so you can still add new workers or remove departing ones separately in the Workers Directory)</li>
                     </ul>
                   </div>
                   <div>
                     <div className="font-bold text-emerald-800">Will NOT be touched:</div>
                     <ul className="list-disc pl-5 space-y-0.5 text-slate-600">
                       <li>User logins, admin officers, and roles</li>
-                      <li>Classes, teachers, and departments</li>
-                      <li>Worker directory, worker categories, and clock-in settings</li>
-                      <li>The outgoing year — it is archived, not deleted</li>
+                      <li>The list of classes and departments</li>
+                      <li>The worker directory (names, phone, QR code, status) and worker categories/clock-in settings</li>
+                      <li>The outgoing year — it is archived, not deleted, along with who held each class/duty this past year</li>
                     </ul>
                   </div>
                 </div>
