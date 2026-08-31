@@ -24,6 +24,8 @@ export interface ResetYearResult {
   newYearId?: string;
   newYearName?: string;
   deletedCounts?: Record<string, number>;
+  classesReassigned?: number;
+  workersReassigned?: number;
 }
 
 export async function resetYearOnServer(params: ResetYearParams): Promise<ResetYearResult> {
@@ -51,6 +53,8 @@ export async function resetYearOnServer(params: ResetYearParams): Promise<ResetY
       newYearId: data.newYearId,
       newYearName: data.newYearName,
       deletedCounts: data.deletedCounts,
+      classesReassigned: data.classesReassigned,
+      workersReassigned: data.workersReassigned,
     };
   } catch (err: any) {
     return { success: false, error: err.message || 'Network error while resetting the year.' };
