@@ -1042,7 +1042,9 @@ export const OpeningFlowView: React.FC<OpeningFlowViewProps> = ({
         </div>
       )}
 
-      {/* Database Backup & Restore Modal */}
+      {/* Database Backup & Restore Modal. This is the pre-login welcome
+          screen — no admin identity exists yet, so reset is never offered
+          here (canAccessReset defaults to false). */}
       <DatabaseBackupModal
         isOpen={isBackupModalOpen}
         onClose={() => setIsBackupModalOpen(false)}

@@ -518,6 +518,7 @@ export const AdminPortalRoot: React.FC<AdminPortalRootProps> = ({
           initialTab={backupModalTab}
           onClose={() => setIsBackupModalOpen(false)}
           onDatabaseRestored={refreshAdminData}
+          canAccessReset={currentAdmin.roleType === 'GENERAL_SUPERINTENDENT'}
         />
       </div>
     );
@@ -1191,12 +1192,15 @@ export const AdminPortalRoot: React.FC<AdminPortalRootProps> = ({
         </div>
       )}
 
-      {/* Database Backup & Restore Modal for Unauthenticated / Claiming Screens */}
+      {/* Database Backup & Restore Modal for Unauthenticated / Claiming Screens.
+          Reset is intentionally never available here — no admin identity has
+          been established yet, so canAccessReset stays false. */}
       <DatabaseBackupModal
         isOpen={isBackupModalOpen}
         initialTab={backupModalTab}
         onClose={() => setIsBackupModalOpen(false)}
         onDatabaseRestored={refreshAdminData}
+        canAccessReset={false}
       />
 
       {/* Footer */}

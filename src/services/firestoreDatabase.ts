@@ -317,3 +317,9 @@ export const cloudDeleteSpecialEventAttendance = (id: string) => removeDocument(
 // 14. Lessons
 export const cloudGetAllLessons = () => fetchCollection<LessonInfo>('lessons');
 export const cloudSaveLesson = (lesson: LessonInfo) => saveDocument<any>('lessons', { ...lesson, id: `WEEK_${lesson.weekNumber}` });
+
+// 15. Reset Year Audit Log & Archived Years (read-only from the client — both
+// collections are written exclusively by the server's Admin SDK during
+// /api/admin/reset-year; see firestore.rules).
+export const cloudGetResetAuditLogs = () => fetchCollection<any>('auditLogs');
+export const cloudGetSundaySchoolYearArchive = () => fetchCollection<SundaySchoolYear>('sundaySchoolYearArchive');
