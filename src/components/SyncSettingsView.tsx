@@ -388,7 +388,9 @@ export const SyncSettingsView: React.FC<SyncSettingsViewProps> = ({
         </form>
       </div>
 
-      {/* Embedded Data Backup & Restore Modal */}
+      {/* Embedded Data Backup & Restore Modal. This is a class-level settings
+          screen, not an executive admin context — reset must never be
+          offered here (canAccessReset defaults to false). */}
       <DatabaseBackupModal
         isOpen={isBackupModalOpen}
         onClose={() => setIsBackupModalOpen(false)}

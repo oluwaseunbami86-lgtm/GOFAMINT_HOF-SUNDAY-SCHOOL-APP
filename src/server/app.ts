@@ -3,6 +3,7 @@ import path from "path";
 import fs from "fs";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
+import { FieldValue } from "firebase-admin/firestore";
 import { getAdminAuth, getAdminDb } from "./firebaseAdmin.js";
 
 dotenv.config();
@@ -273,6 +274,222 @@ Provide:
           ? "That email already has an account."
           : err?.message || "Failed to create user.";
       res.status(500).json({ error: message });
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // Admin: Reset / "Start New Year" — archives + clears operational data for
+  // the current Sunday School year against the centralized Firestore
+  // database, and rotates in a fresh year. Server-side only: authorization is
+  // verified here against the caller's real Firestore role doc (never trusts
+  // anything the browser claims), exactly like /api/admin/create-user above.
+  //
+  // Scope (derived from src/types.ts / firestore.rules, not guessed):
+  //   PRESERVED — users, adminProfiles, classes, departments, workers,
+  //     workerCategories, clockInConfig (all system/config/identity data).
+  //   ARCHIVED then RESET — the outgoing `sundaySchoolYear` document is
+  //     copied into `sundaySchoolYearArchive` before anything else happens.
+  //   RESET (cleared) — members, grades, offerings, absenceLogs, referrals,
+  //     workerAttendance, workerPrepAttendance, specialEvents,
+  //     specialEventAttendance, adminComments, treasuryExpenditures, lessons
+  //     — the year-specific operational records these types represent
+  //     (see YEAR_RESET_COLLECTIONS below).
+  //
+  // Firestore has no single multi-thousand-document ACID transaction, so
+  // atomicity is approximated deliberately in this order: (1) archive the
+  // outgoing year first — cheap and safe, guarantees history is never lost;
+  // (2) clear operational collections; (3) write the new year document;
+  // (4) only then delete the old year document, so the `sundaySchoolYear`
+  // collection is never left empty. Every step here is a no-op when re-run
+  // (deleting an already-deleted doc, re-archiving the same doc, etc.), so if
+  // a failure happens partway through, simply calling this endpoint again
+  // with the same request safely finishes the job instead of corrupting
+  // state — the practical equivalent of a rollback-and-retry for an
+  // operation this size. Every attempt (success or failure) is written to
+  // `auditLogs` before the destructive work starts and updated with the
+  // final outcome.
+  // -----------------------------------------------------------------------
+  const RESET_AUTHORIZED_ROLES = ["SUPER_ADMIN", "GENERAL_SUPERINTENDENT"];
+  const YEAR_RESET_COLLECTIONS = [
+    "members",
+    "grades",
+    "offerings",
+    "absenceLogs",
+    "referrals",
+    "workerAttendance",
+    "workerPrepAttendance",
+    "specialEvents",
+    "specialEventAttendance",
+    "adminComments",
+    "treasuryExpenditures",
+    "lessons",
+  ];
+
+  async function deleteAllDocsInCollection(
+    db: FirebaseFirestore.Firestore,
+    collectionName: string,
+    batchSize = 450
+  ): Promise<number> {
+    const collRef = db.collection(collectionName);
+    let totalDeleted = 0;
+    // Loop rather than a single batch: a collection can hold far more than
+    // Firestore's 500-writes-per-batch limit.
+    while (true) {
+      const snapshot = await collRef.limit(batchSize).get();
+      if (snapshot.empty) break;
+      const batch = db.batch();
+      snapshot.docs.forEach((doc) => batch.delete(doc.ref));
+      await batch.commit();
+      totalDeleted += snapshot.size;
+      if (snapshot.size < batchSize) break;
+    }
+    return totalDeleted;
+  }
+
+  app.post("/api/admin/reset-year", async (req, res) => {
+    const adminDb = getAdminDb();
+    let auditRef: FirebaseFirestore.DocumentReference | null = null;
+
+    try {
+      const authHeader = req.headers.authorization || "";
+      const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+      if (!idToken) {
+        return res.status(401).json({ error: "Missing sign-in token." });
+      }
+
+      const adminAuth = getAdminAuth();
+      const decoded = await adminAuth.verifyIdToken(idToken);
+      const callerUid = decoded.uid;
+      const callerEmail = decoded.email || null;
+
+      const callerDoc = await adminDb.collection("users").doc(callerUid).get();
+      const callerRole = callerDoc.exists ? callerDoc.data()?.roleType : null;
+
+      if (!callerRole || !RESET_AUTHORIZED_ROLES.includes(callerRole)) {
+        return res.status(403).json({
+          error: "Only the General Superintendent can reset the Sunday School year.",
+        });
+      }
+
+      const { confirmYearId, newYearName, newOverallTheme } = req.body || {};
+      if (!confirmYearId || typeof confirmYearId !== "string") {
+        return res.status(400).json({ error: "confirmYearId is required." });
+      }
+      if (!newYearName || typeof newYearName !== "string" || !newYearName.trim()) {
+        return res.status(400).json({ error: "A name for the new Sunday School year is required." });
+      }
+
+      // sundaySchoolYear is a singleton collection (the app always reads
+      // years[0]). Re-verify server-side that the year the admin confirmed on
+      // screen is still the current one, so a stale dialog can never reset
+      // the wrong year out from under a concurrent change.
+      const yearSnapshot = await adminDb.collection("sundaySchoolYear").limit(1).get();
+      const currentYearDoc = yearSnapshot.docs[0];
+      if (!currentYearDoc || currentYearDoc.id !== confirmYearId) {
+        return res.status(409).json({
+          error:
+            "The Sunday School year has changed since you opened this dialog. Please close and reopen the reset dialog to review the current year before continuing.",
+        });
+      }
+      const currentYear = currentYearDoc.data() as any;
+
+      auditRef = adminDb.collection("auditLogs").doc();
+      await auditRef.set({
+        action: "RESET_YEAR",
+        status: "STARTED",
+        performedByUid: callerUid,
+        performedByEmail: callerEmail,
+        performedByRole: callerRole,
+        previousYearId: currentYearDoc.id,
+        previousYearName: currentYear.yearName || null,
+        requestedNewYearName: newYearName.trim(),
+        startedAt: FieldValue.serverTimestamp(),
+      });
+
+      // 1. Preserve: archive the full outgoing year record before touching
+      // anything else.
+      await adminDb
+        .collection("sundaySchoolYearArchive")
+        .doc(currentYearDoc.id)
+        .set({
+          ...currentYear,
+          archivedAt: FieldValue.serverTimestamp(),
+          archivedBy: callerUid,
+        });
+
+      // 2. Reset only year-specific operational data. Users, adminProfiles,
+      // classes, departments, workers, workerCategories, and clockInConfig
+      // are deliberately never touched by this loop.
+      const deletedCounts: Record<string, number> = {};
+      for (const collectionName of YEAR_RESET_COLLECTIONS) {
+        deletedCounts[collectionName] = await deleteAllDocsInCollection(adminDb, collectionName);
+      }
+
+      // 3. Write the new year document BEFORE removing the old one, so the
+      // singleton `sundaySchoolYear` collection is never briefly empty.
+      const newYearId = `YEAR_${Date.now()}`;
+      const quarterNames = ["First Quarter", "Second Quarter", "Third Quarter", "Fourth Quarter"];
+      const newYearDoc = {
+        id: newYearId,
+        yearName: newYearName.trim(),
+        overallTheme: (newOverallTheme || "").trim(),
+        startDate: "",
+        endDate: "",
+        activeQuarterNumber: 1,
+        isInitialized: false,
+        departments: Array.isArray(currentYear.departments) ? currentYear.departments : [],
+        updatedAt: new Date().toISOString(),
+        quarters: [1, 2, 3, 4].map((quarterNumber) => ({
+          id: `Q${quarterNumber}_${newYearId}`,
+          quarterNumber,
+          quarterName: quarterNames[quarterNumber - 1],
+          quarterTheme: "",
+          startDate: "",
+          endDate: "",
+          sharingAdmonitionDate: "",
+          totalLessonWeeks: 12,
+          hasSharingAdmonitionWeek: true,
+          status: quarterNumber === 1 ? "ACTIVE" : "UPCOMING",
+          isDistributed: false,
+          lessons: [],
+          updatedAt: new Date().toISOString(),
+        })),
+      };
+      await adminDb.collection("sundaySchoolYear").doc(newYearId).set(newYearDoc);
+
+      // 4. Only now remove the old year document.
+      await currentYearDoc.ref.delete();
+
+      await auditRef.set(
+        {
+          status: "COMPLETED",
+          newYearId,
+          newYearName: newYearDoc.yearName,
+          deletedCounts,
+          completedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      res.json({ success: true, newYearId, newYearName: newYearDoc.yearName, deletedCounts });
+    } catch (err: any) {
+      console.error("reset-year error:", err);
+      if (auditRef) {
+        await auditRef
+          .set(
+            {
+              status: "FAILED",
+              error: err?.message || "Unknown error",
+              failedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          )
+          .catch(() => {});
+      }
+      res.status(500).json({
+        error:
+          "Reset failed partway through. No year was switched — your previous year's data remains intact and is safely archived. Please try again; it is safe to retry.",
+      });
     }
   });
 

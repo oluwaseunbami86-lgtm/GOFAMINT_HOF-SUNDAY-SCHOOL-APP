@@ -466,6 +466,22 @@ service cloud.firestore {
       );
     }
 
+    // 21. Year Reset Audit Log (written only by the server's Admin SDK via
+    // /api/admin/reset-year, which bypasses these rules entirely — this just
+    // lets Executive Admins view the history from the client).
+    match /auditLogs/{logId} {
+      allow read: if isAuthenticated() && isExecAdmin();
+      allow write: if false;
+    }
+
+    // 22. Archived Sunday School Years (written only by the server's Admin
+    // SDK during a year reset; kept readable so historical themes/quarters
+    // can still be reviewed after a reset).
+    match /sundaySchoolYearArchive/{yearId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+
     // =========================================================================
     // DEFAULT DENY SAFETY NET
     // =========================================================================

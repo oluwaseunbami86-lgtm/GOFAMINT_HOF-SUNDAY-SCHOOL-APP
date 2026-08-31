@@ -14,6 +14,15 @@ import { getFirestore } from 'firebase-admin/firestore';
  * Variables in production). Never commit that file or its contents to git.
  */
 
+// Must match the client's `firestoreDatabaseId` in firebase-applet-config.json —
+// this project uses a named Firestore database, not the "(default)" one. Without
+// this, the admin SDK silently reads/writes a different (empty) database than the
+// one the client app and its Firestore security rules operate on: role look-ups
+// like `users/{uid}` would never be found and every server-side authorization
+// check would incorrectly fail closed. (Not a secret — this same ID already ships
+// to every browser in the client-side Firebase config, so it's safe to hardcode.)
+export const FIRESTORE_DATABASE_ID = 'ai-studio-remixremixremixr-e1005fdc-a3ec-4e1c-8527-666bdea0d747';
+
 let adminApp: App | null = null;
 
 function getAdminApp(): App {
@@ -41,5 +50,5 @@ export function getAdminAuth() {
 }
 
 export function getAdminDb() {
-  return getFirestore(getAdminApp());
+  return getFirestore(getAdminApp(), FIRESTORE_DATABASE_ID);
 }

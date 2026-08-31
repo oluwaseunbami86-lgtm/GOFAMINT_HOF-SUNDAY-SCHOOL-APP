@@ -13,7 +13,7 @@ import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
 import { initializeApp, getApps, cert } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
-import { getFirestore } from "firebase-admin/firestore";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
 
 // Must match the client's firestoreDatabaseId in firebase-applet-config.json —
 // this project uses a named Firestore database, not the "(default)" one.
@@ -312,6 +312,182 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
           ? "That email already has an account."
           : err?.message || "Failed to create user.";
       res.status(500).json({ error: message });
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // Admin: Reset / "Start New Year" — kept in sync with the same endpoint in
+  // src/server/app.ts (see the comment there for the full rationale). Scope:
+  //   PRESERVED — users, adminProfiles, classes, departments, workers,
+  //     workerCategories, clockInConfig.
+  //   ARCHIVED then RESET — sundaySchoolYear (copied to
+  //     sundaySchoolYearArchive before the current doc is replaced).
+  //   RESET (cleared) — members, grades, offerings, absenceLogs, referrals,
+  //     workerAttendance, workerPrepAttendance, specialEvents,
+  //     specialEventAttendance, adminComments, treasuryExpenditures, lessons.
+  // -----------------------------------------------------------------------
+  const RESET_AUTHORIZED_ROLES = ["SUPER_ADMIN", "GENERAL_SUPERINTENDENT"];
+  const YEAR_RESET_COLLECTIONS = [
+    "members",
+    "grades",
+    "offerings",
+    "absenceLogs",
+    "referrals",
+    "workerAttendance",
+    "workerPrepAttendance",
+    "specialEvents",
+    "specialEventAttendance",
+    "adminComments",
+    "treasuryExpenditures",
+    "lessons",
+  ];
+
+  async function deleteAllDocsInCollection(db: any, collectionName: string, batchSize = 450): Promise<number> {
+    const collRef = db.collection(collectionName);
+    let totalDeleted = 0;
+    while (true) {
+      const snapshot = await collRef.limit(batchSize).get();
+      if (snapshot.empty) break;
+      const batch = db.batch();
+      snapshot.docs.forEach((doc: any) => batch.delete(doc.ref));
+      await batch.commit();
+      totalDeleted += snapshot.size;
+      if (snapshot.size < batchSize) break;
+    }
+    return totalDeleted;
+  }
+
+  app.post("/api/admin/reset-year", async (req, res) => {
+    const adminDb = getAdminDb();
+    let auditRef: any = null;
+
+    try {
+      const authHeader = req.headers.authorization || "";
+      const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+      if (!idToken) {
+        return res.status(401).json({ error: "Missing sign-in token." });
+      }
+
+      const adminAuth = getAdminAuth();
+      const decoded = await adminAuth.verifyIdToken(idToken);
+      const callerUid = decoded.uid;
+      const callerEmail = decoded.email || null;
+
+      const callerDoc = await adminDb.collection("users").doc(callerUid).get();
+      const callerRole = callerDoc.exists ? callerDoc.data()?.roleType : null;
+
+      if (!callerRole || !RESET_AUTHORIZED_ROLES.includes(callerRole)) {
+        return res.status(403).json({
+          error: "Only the General Superintendent can reset the Sunday School year.",
+        });
+      }
+
+      const { confirmYearId, newYearName, newOverallTheme } = req.body || {};
+      if (!confirmYearId || typeof confirmYearId !== "string") {
+        return res.status(400).json({ error: "confirmYearId is required." });
+      }
+      if (!newYearName || typeof newYearName !== "string" || !newYearName.trim()) {
+        return res.status(400).json({ error: "A name for the new Sunday School year is required." });
+      }
+
+      const yearSnapshot = await adminDb.collection("sundaySchoolYear").limit(1).get();
+      const currentYearDoc = yearSnapshot.docs[0];
+      if (!currentYearDoc || currentYearDoc.id !== confirmYearId) {
+        return res.status(409).json({
+          error:
+            "The Sunday School year has changed since you opened this dialog. Please close and reopen the reset dialog to review the current year before continuing.",
+        });
+      }
+      const currentYear = currentYearDoc.data() as any;
+
+      auditRef = adminDb.collection("auditLogs").doc();
+      await auditRef.set({
+        action: "RESET_YEAR",
+        status: "STARTED",
+        performedByUid: callerUid,
+        performedByEmail: callerEmail,
+        performedByRole: callerRole,
+        previousYearId: currentYearDoc.id,
+        previousYearName: currentYear.yearName || null,
+        requestedNewYearName: newYearName.trim(),
+        startedAt: FieldValue.serverTimestamp(),
+      });
+
+      await adminDb
+        .collection("sundaySchoolYearArchive")
+        .doc(currentYearDoc.id)
+        .set({
+          ...currentYear,
+          archivedAt: FieldValue.serverTimestamp(),
+          archivedBy: callerUid,
+        });
+
+      const deletedCounts: Record<string, number> = {};
+      for (const collectionName of YEAR_RESET_COLLECTIONS) {
+        deletedCounts[collectionName] = await deleteAllDocsInCollection(adminDb, collectionName);
+      }
+
+      const newYearId = `YEAR_${Date.now()}`;
+      const quarterNames = ["First Quarter", "Second Quarter", "Third Quarter", "Fourth Quarter"];
+      const newYearDoc = {
+        id: newYearId,
+        yearName: newYearName.trim(),
+        overallTheme: (newOverallTheme || "").trim(),
+        startDate: "",
+        endDate: "",
+        activeQuarterNumber: 1,
+        isInitialized: false,
+        departments: Array.isArray(currentYear.departments) ? currentYear.departments : [],
+        updatedAt: new Date().toISOString(),
+        quarters: [1, 2, 3, 4].map((quarterNumber) => ({
+          id: `Q${quarterNumber}_${newYearId}`,
+          quarterNumber,
+          quarterName: quarterNames[quarterNumber - 1],
+          quarterTheme: "",
+          startDate: "",
+          endDate: "",
+          sharingAdmonitionDate: "",
+          totalLessonWeeks: 12,
+          hasSharingAdmonitionWeek: true,
+          status: quarterNumber === 1 ? "ACTIVE" : "UPCOMING",
+          isDistributed: false,
+          lessons: [],
+          updatedAt: new Date().toISOString(),
+        })),
+      };
+      await adminDb.collection("sundaySchoolYear").doc(newYearId).set(newYearDoc);
+      await currentYearDoc.ref.delete();
+
+      await auditRef.set(
+        {
+          status: "COMPLETED",
+          newYearId,
+          newYearName: newYearDoc.yearName,
+          deletedCounts,
+          completedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      res.json({ success: true, newYearId, newYearName: newYearDoc.yearName, deletedCounts });
+    } catch (err: any) {
+      console.error("reset-year error:", err);
+      if (auditRef) {
+        await auditRef
+          .set(
+            {
+              status: "FAILED",
+              error: err?.message || "Unknown error",
+              failedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          )
+          .catch(() => {});
+      }
+      res.status(500).json({
+        error:
+          "Reset failed partway through. No year was switched — your previous year's data remains intact and is safely archived. Please try again; it is safe to retry.",
+      });
     }
   });
 

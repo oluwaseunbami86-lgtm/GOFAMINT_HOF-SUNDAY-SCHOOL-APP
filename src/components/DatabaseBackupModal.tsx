@@ -35,7 +35,6 @@ import {
   getLocalBrowserSnapshots,
   deleteLocalBrowserSnapshot,
   restoreLocalBrowserSnapshot,
-  resetToFreshCleanSystem,
   LocalSnapshotItem
 } from '../db/indexedDB';
 import {
@@ -46,12 +45,22 @@ import {
   DataBackupSummary,
   DataImportResult
 } from '../services/dataBackupService';
+import { cloudGetSundaySchoolYear } from '../services/firestoreDatabase';
+import { resetYearOnServer } from '../services/resetYearApi';
+import { hydrateLocalFromCloud } from '../services/cloudSyncManager';
 
 interface DatabaseBackupModalProps {
   isOpen: boolean;
   onClose: () => void;
   initialTab?: 'SAVE' | 'LOAD' | 'RESET';
   onDatabaseRestored?: () => void;
+  // Controls whether the "Start New Year" (reset) tab is shown at all. This is
+  // a UX convenience only — the real authorization check happens server-side
+  // in /api/admin/reset-year, which re-verifies the signed-in user's role
+  // against Firestore regardless of what this prop is set to. Defaults to
+  // false so any caller that doesn't explicitly opt in (pre-login screens,
+  // class-level settings) never shows the tab.
+  canAccessReset?: boolean;
 }
 
 // Gentle success chime using Web Audio API
@@ -84,9 +93,10 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
   isOpen,
   onClose,
   initialTab = 'SAVE',
-  onDatabaseRestored
+  onDatabaseRestored,
+  canAccessReset = false
 }) => {
-  const [activeTab, setActiveTab] = useState<'SAVE' | 'LOAD' | 'RESET'>(initialTab);
+  const [activeTab, setActiveTab] = useState<'SAVE' | 'LOAD' | 'RESET'>(initialTab === 'RESET' && !canAccessReset ? 'SAVE' : initialTab);
   const [stats, setStats] = useState<any>(null);
   const [isLoadingStats, setIsLoadingStats] = useState(true);
   const [customLabel, setCustomLabel] = useState('');
@@ -114,13 +124,19 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Reset Database States
+  // Reset ("Start New Year") States — this now performs a real server-side
+  // reset against the centralized Firestore database (see resetYearApi.ts),
+  // scoped to the current Sunday School year, not a local-only wipe.
   const [isResetting, setIsResetting] = useState(false);
   const [resetConfirmInput, setResetConfirmInput] = useState('');
-  const [resetMode, setResetMode] = useState<'STANDARD_INITIALIZED' | 'UNINITIALIZED_BLANK'>('STANDARD_INITIALIZED');
   const [resetSuccess, setResetSuccess] = useState<string | null>(null);
   const [resetStepText, setResetStepText] = useState<string>('');
   const [resetProgressPct, setResetProgressPct] = useState<number>(0);
+  const [currentYearId, setCurrentYearId] = useState<string | null>(null);
+  const [currentYearName, setCurrentYearName] = useState<string>('');
+  const [isLoadingCurrentYear, setIsLoadingCurrentYear] = useState(false);
+  const [newYearName, setNewYearName] = useState('');
+  const [newOverallTheme, setNewOverallTheme] = useState('');
 
   // Refresh DB stats and local snapshots
   const refreshData = async () => {
@@ -139,9 +155,28 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
     }
   };
 
+  // Loads the CURRENT year directly from the centralized database (not the
+  // local cache) so the admin is always confirming against the live state —
+  // the server re-validates this same id before making any changes.
+  const loadCurrentYearForReset = async () => {
+    setIsLoadingCurrentYear(true);
+    try {
+      const year = await cloudGetSundaySchoolYear();
+      setCurrentYearId(year?.id || null);
+      setCurrentYearName(year?.yearName || '(Unnamed Year)');
+    } catch (err) {
+      console.error('Error loading current Sunday School year:', err);
+      setCurrentYearId(null);
+      setCurrentYearName('');
+    } finally {
+      setIsLoadingCurrentYear(false);
+    }
+  };
+
   useEffect(() => {
     if (isOpen) {
-      setActiveTab(initialTab);
+      const safeInitialTab = initialTab === 'RESET' && !canAccessReset ? 'SAVE' : initialTab;
+      setActiveTab(safeInitialTab);
       setFileError(null);
       setSelectedFile(null);
       setRawParsedJson(null);
@@ -157,9 +192,14 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
       setRestoreProgressPct(0);
       setResetProgressPct(0);
       setConfirmDeleteSnapshotId(null);
+      setNewYearName('');
+      setNewOverallTheme('');
       refreshData();
+      if (canAccessReset) {
+        loadCurrentYearForReset();
+      }
     }
-  }, [isOpen, initialTab]);
+  }, [isOpen, initialTab, canAccessReset]);
 
   if (!isOpen) return null;
 
@@ -368,11 +408,19 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
     }
   };
 
-  // Handle Clean Database Reset
+  // Handle Server-Side Year Reset ("Start New Year")
   const handleExecuteReset = async () => {
     if (isResetting || isRestoring) return;
     if (resetConfirmInput.trim().toUpperCase() !== 'RESET') {
-      setFileError('Security confirmation required: Please type the word RESET to confirm database reset.');
+      setFileError('Security confirmation required: Please type the word RESET to confirm.');
+      return;
+    }
+    if (!currentYearId) {
+      setFileError('Could not confirm the current Sunday School year from the server. Please close and reopen this dialog and try again.');
+      return;
+    }
+    if (!newYearName.trim()) {
+      setFileError('Please enter a name for the new Sunday School year (e.g. "2026–2027").');
       return;
     }
 
@@ -382,30 +430,30 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
     setIsResetting(true);
 
     try {
-      setResetStepText('🔄 Purging all local data tables, rosters, and offline sync logs...');
-      setResetProgressPct(25);
-      await sleep(250);
+      setResetStepText('🗄️ Archiving the current year\'s records...');
+      setResetProgressPct(20);
 
-      setResetStepText('🧹 Resetting administrative credentials and session authorization tokens...');
-      setResetProgressPct(55);
-      await sleep(250);
+      setResetStepText('🧹 Clearing this year\'s rosters, grades, offerings, and attendance from the central database...');
+      setResetProgressPct(45);
 
-      setResetStepText(
-        resetMode === 'STANDARD_INITIALIZED'
-          ? '✨ Initializing 4-Department Sunday School curriculum & workers directory...'
-          : '✨ Initializing blank Sunday School structure...'
-      );
-      setResetProgressPct(85);
+      const result = await resetYearOnServer({
+        confirmYearId: currentYearId,
+        newYearName: newYearName.trim(),
+        newOverallTheme: newOverallTheme.trim()
+      });
 
-      await resetToFreshCleanSystem(resetMode);
-      await sleep(300);
+      if (!result.success) {
+        throw new Error(result.error || 'The server rejected the reset request.');
+      }
+
+      setResetStepText('☁️ Syncing the new year down to this device...');
+      setResetProgressPct(80);
+      await hydrateLocalFromCloud();
 
       setResetProgressPct(100);
-      setResetStepText('✅ Database reset completed!');
+      setResetStepText('✅ New year started!');
       setResetSuccess(
-        resetMode === 'STANDARD_INITIALIZED'
-          ? 'Database has been cleanly reset to default GOFAMINT_HOF Sunday School specifications with 4 standard departments and Quarter 1 curriculum ready.'
-          : 'Database has been cleanly wiped to a fresh uninitialized state.'
+        `"${result.newYearName}" is now the active Sunday School year. The previous year's records have been safely archived and cleared from every device — users, roles, classes, workers, and departments were not affected.`
       );
 
       playSuccessSound();
@@ -416,13 +464,15 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
       });
 
       setResetConfirmInput('');
+      setNewYearName('');
+      setNewOverallTheme('');
       await refreshData();
 
       if (onDatabaseRestored) {
         onDatabaseRestored();
       }
     } catch (err: any) {
-      setFileError(`Database reset failed: ${err.message || 'Unknown error'}`);
+      setFileError(`Reset failed: ${err.message || 'Unknown error'}. No changes were applied — your data is intact.`);
     } finally {
       setIsResetting(false);
     }
@@ -498,20 +548,22 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
             <span>📂 Import Data</span>
           </button>
 
-          <button
-            id="tab-reset-db"
-            onClick={() => {
-              if (!isRestoring && !isResetting) setActiveTab('RESET');
-            }}
-            className={`px-4 py-2.5 rounded-t-xl text-xs sm:text-sm font-black flex items-center gap-2 transition border-t border-x shrink-0 ${
-              activeTab === 'RESET'
-                ? 'bg-white text-rose-950 border-slate-200 -mb-px shadow-xs ring-1 ring-rose-300'
-                : 'text-rose-700 hover:text-rose-900 border-transparent hover:bg-rose-100/60'
-            }`}
-          >
-            <Trash2 className="w-4 h-4 text-rose-600" />
-            <span>🔄 Reset Data</span>
-          </button>
+          {canAccessReset && (
+            <button
+              id="tab-reset-db"
+              onClick={() => {
+                if (!isRestoring && !isResetting) setActiveTab('RESET');
+              }}
+              className={`px-4 py-2.5 rounded-t-xl text-xs sm:text-sm font-black flex items-center gap-2 transition border-t border-x shrink-0 ${
+                activeTab === 'RESET'
+                  ? 'bg-white text-rose-950 border-slate-200 -mb-px shadow-xs ring-1 ring-rose-300'
+                  : 'text-rose-700 hover:text-rose-900 border-transparent hover:bg-rose-100/60'
+              }`}
+            >
+              <Trash2 className="w-4 h-4 text-rose-600" />
+              <span>🗓️ Start New Year</span>
+            </button>
+          )}
         </div>
 
         {/* Modal Body */}
@@ -1057,10 +1109,10 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
             </div>
           )}
 
-          {/* TAB 3: RESET DATA */}
-          {activeTab === 'RESET' && (
+          {/* TAB 3: START NEW YEAR (server-side reset) */}
+          {activeTab === 'RESET' && canAccessReset && (
             <div className="space-y-6 animate-fade-in">
-              
+
               <div className="bg-rose-50 border-2 border-rose-300 rounded-2xl p-5 space-y-3">
                 <div className="flex items-start gap-3">
                   <div className="w-10 h-10 rounded-xl bg-rose-600 text-white flex items-center justify-center shrink-0 shadow-sm">
@@ -1068,21 +1120,35 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
                   </div>
                   <div>
                     <h4 className="text-base font-black text-rose-950 font-['Cinzel',serif]">
-                      Reset Church Data to Clean State
+                      Start New Sunday School Year
                     </h4>
                     <p className="text-xs text-rose-800 mt-1 leading-relaxed">
-                      Clears current local class rosters, student enrollments, weekly scores, and offering registries to start completely fresh.
+                      This clears the CURRENT year's operational records from the central database — on every device, for everyone — and rotates in a new year. It is not a full data wipe.
                     </p>
                   </div>
                 </div>
 
-                <div className="bg-white/80 rounded-xl p-3 border border-rose-200 text-xs text-slate-700 space-y-1.5">
-                  <div className="font-bold text-slate-900">Reset specifications:</div>
-                  <ul className="list-disc pl-5 space-y-1 text-slate-600">
-                    <li>Purges member rosters, visitors, and attendance histories.</li>
-                    <li>Resets 12-week scoring ledgers and weekly offerings.</li>
-                    <li>Preserves the 4 standard departments and curriculum structure.</li>
-                  </ul>
+                <div className="bg-white/80 rounded-xl p-3 border border-rose-200 text-xs text-slate-700 space-y-2">
+                  <div>
+                    <div className="font-bold text-rose-800">Will be cleared for the new year:</div>
+                    <ul className="list-disc pl-5 space-y-0.5 text-slate-600">
+                      <li>Member & visitor rosters, quarter enrollments</li>
+                      <li>Weekly grades, offerings, and absence/welfare logs</li>
+                      <li>Evangelism referrals and admin comments</li>
+                      <li>Worker Sunday & preparatory-class attendance</li>
+                      <li>Special events and their attendance</li>
+                      <li>Treasury expenditures and the lesson curriculum</li>
+                    </ul>
+                  </div>
+                  <div>
+                    <div className="font-bold text-emerald-800">Will NOT be touched:</div>
+                    <ul className="list-disc pl-5 space-y-0.5 text-slate-600">
+                      <li>User logins, admin officers, and roles</li>
+                      <li>Classes, teachers, and departments</li>
+                      <li>Worker directory, worker categories, and clock-in settings</li>
+                      <li>The outgoing year — it is archived, not deleted</li>
+                    </ul>
+                  </div>
                 </div>
               </div>
 
@@ -1101,7 +1167,7 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
                         <span className="text-xs text-rose-200 font-bold">{resetProgressPct}%</span>
                       </div>
                       <h4 className="text-sm sm:text-base font-black text-white mt-0.5">
-                        Resetting Database Stores...
+                        Resetting the Central Database...
                       </h4>
                     </div>
                   </div>
@@ -1115,7 +1181,7 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
 
                   <div className="bg-rose-950/60 rounded-lg px-3 py-2 border border-rose-800/80 flex items-center gap-2 text-xs text-rose-100 font-mono">
                     <Sparkles className="w-3.5 h-3.5 text-amber-300 shrink-0 animate-pulse" />
-                    <span>{resetStepText || 'Cleaning database tables...'}</span>
+                    <span>{resetStepText || 'Working...'}</span>
                   </div>
                 </div>
               )}
@@ -1129,10 +1195,10 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
                     </div>
                     <div className="flex-1">
                       <span className="text-[10px] font-black uppercase text-emerald-900 bg-emerald-200 px-2 py-0.5 rounded border border-emerald-300">
-                        RESET COMPLETED
+                        NEW YEAR STARTED
                       </span>
                       <h3 className="text-lg font-black text-emerald-950 mt-1">
-                        Database Has Been Freshly Reset!
+                        The New Sunday School Year Is Active!
                       </h3>
                       <p className="text-xs text-emerald-900 mt-1 leading-relaxed">
                         {resetSuccess}
@@ -1146,57 +1212,56 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
                       onClick={onClose}
                       className="w-full sm:w-auto px-6 py-3 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs sm:text-sm font-black flex items-center justify-center gap-2 shadow-md transition active:scale-95 cursor-pointer"
                     >
-                      <span>🚀 Continue to Clean System</span>
+                      <span>🚀 Continue</span>
                       <ArrowRight className="w-4 h-4" />
                     </button>
                   </div>
                 </div>
               )}
 
-              {/* Reset Mode Selection & Confirmation */}
+              {/* New Year Details & Confirmation */}
               {!isResetting && !resetSuccess && (
                 <div className="bg-slate-50 border border-slate-200 rounded-2xl p-5 space-y-4">
                   <div>
-                    <label className="text-xs font-bold text-slate-800 block mb-2">
-                      Select Reset Specification:
+                    <label className="text-xs font-bold text-slate-800 block mb-1">
+                      Current year (confirmed against the live database):
                     </label>
-                    <div className="space-y-2">
-                      <label className="flex items-start gap-2.5 p-3 bg-white border border-slate-200 rounded-xl cursor-pointer hover:border-blue-400 transition">
-                        <input
-                          type="radio"
-                          name="resetMode"
-                          checked={resetMode === 'STANDARD_INITIALIZED'}
-                          onChange={() => setResetMode('STANDARD_INITIALIZED')}
-                          className="mt-0.5 text-blue-900 focus:ring-blue-600"
-                        />
-                        <div>
-                          <div className="text-xs font-bold text-slate-900">
-                            Standard Sunday School Year (Recommended)
-                          </div>
-                          <div className="text-[11px] text-slate-500 mt-0.5">
-                            Initializes 4 departments (Adult, Youth, Teenagers, Children), active Quarter 1 with 12 lesson curriculum, and standard workers seed directory.
-                          </div>
-                        </div>
-                      </label>
-
-                      <label className="flex items-start gap-2.5 p-3 bg-white border border-slate-200 rounded-xl cursor-pointer hover:border-blue-400 transition">
-                        <input
-                          type="radio"
-                          name="resetMode"
-                          checked={resetMode === 'UNINITIALIZED_BLANK'}
-                          onChange={() => setResetMode('UNINITIALIZED_BLANK')}
-                          className="mt-0.5 text-blue-900 focus:ring-blue-600"
-                        />
-                        <div>
-                          <div className="text-xs font-bold text-slate-900">
-                            Completely Blank Uninitialized System
-                          </div>
-                          <div className="text-[11px] text-slate-500 mt-0.5">
-                            Purges all data and prompts General Superintendent / Secretary to perform fresh first-run setup.
-                          </div>
-                        </div>
-                      </label>
+                    <div className="px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl text-xs text-slate-700 font-mono">
+                      {isLoadingCurrentYear
+                        ? 'Checking with the server...'
+                        : currentYearId
+                          ? currentYearName
+                          : 'Could not confirm the current year — close and reopen this dialog.'}
                     </div>
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-bold text-slate-800 block mb-1">
+                      New Sunday School Year name:
+                    </label>
+                    <input
+                      type="text"
+                      value={newYearName}
+                      onChange={(e) => {
+                        setNewYearName(e.target.value);
+                        setFileError(null);
+                      }}
+                      placeholder="e.g. 2026–2027"
+                      className="w-full px-3.5 py-2.5 bg-white border border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-200 rounded-xl text-xs text-slate-900"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-bold text-slate-800 block mb-1">
+                      Overall theme <span className="font-normal text-slate-400">(optional)</span>:
+                    </label>
+                    <input
+                      type="text"
+                      value={newOverallTheme}
+                      onChange={(e) => setNewOverallTheme(e.target.value)}
+                      placeholder="e.g. Walking in Divine Light and Truth (1 John 1:7)"
+                      className="w-full px-3.5 py-2.5 bg-white border border-slate-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-200 rounded-xl text-xs text-slate-900"
+                    />
                   </div>
 
                   {fileError && (
@@ -1226,11 +1291,11 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
                     <button
                       id="btn-execute-reset-database"
                       onClick={handleExecuteReset}
-                      disabled={isResetting || resetConfirmInput.trim().toUpperCase() !== 'RESET'}
+                      disabled={isResetting || !currentYearId || !newYearName.trim() || resetConfirmInput.trim().toUpperCase() !== 'RESET'}
                       className="w-full py-3.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black rounded-xl text-xs sm:text-sm flex items-center justify-center gap-2 shadow-md transition active:scale-98 cursor-pointer"
                     >
                       <Trash2 className="w-4 h-4" />
-                      <span>Permanently Reset Database</span>
+                      <span>Reset {currentYearName || 'Current Year'} & Start New Year</span>
                     </button>
                   </div>
                 </div>
