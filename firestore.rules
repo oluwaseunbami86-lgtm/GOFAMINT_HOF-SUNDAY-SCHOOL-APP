@@ -22,6 +22,21 @@ service cloud.firestore {
       return userDocExists() && ('roleType' in getUserData()) ? getUserData().roleType : '';
     }
 
+    // A deactivated `users/{uid}` doc must not be able to read/write despite
+    // holding a still-valid Firebase Auth session (Requirement 9: never rely
+    // on hiding menu items alone). Additive and safe: an account with NO
+    // `users/{uid}` doc at all (every pre-existing class/office login that
+    // predates this feature) is treated as active and completely unaffected
+    // — this only ever blocks an account that was explicitly deactivated.
+    // NOT YET WIRED into isAuthenticated() or any specific collection rule
+    // below — that requires deciding, collection by collection, whether a
+    // deactivated account may still need read-only access to anything (e.g.
+    // to see why they were locked out), so it is being introduced here as an
+    // available building block rather than rushed into every rule at once.
+    function isAccountActive() {
+      return !userDocExists() || getUserData().status != 'DEACTIVATED';
+    }
+
     // Role Hierarchy Evaluators
     function isSuperAdmin() {
       return isAuthenticated() && userDocExists() && getUserRole() == 'SUPER_ADMIN';
