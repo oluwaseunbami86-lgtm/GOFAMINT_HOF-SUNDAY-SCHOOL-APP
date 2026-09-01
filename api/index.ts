@@ -258,28 +258,38 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
     "CLASS_SECRETARY",
     "WORKER",
   ];
+  // GENERAL_SUPERINTENDENT and GENERAL_SECRETARY accounts are permanent: no
+  // endpoint below will deactivate, delete, or change the role of a user
+  // whose CURRENT roleType is one of these, and no one can act on their own
+  // account through these endpoints either.
+  const PROTECTED_ROLES = ["SUPER_ADMIN", "GENERAL_SUPERINTENDENT", "GENERAL_SECRETARY"];
+
+  async function requireExecCaller(req: any, res: any, adminDb: any, adminAuth: any) {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) {
+      res.status(401).json({ error: "Missing sign-in token." });
+      return null;
+    }
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const callerUid = decoded.uid;
+    const callerDoc = await adminDb.collection("users").doc(callerUid).get();
+    const callerRole = callerDoc.exists ? callerDoc.data()?.roleType : null;
+    if (!callerRole || !EXEC_ROLES.includes(callerRole)) {
+      res.status(403).json({ error: "You do not have permission to manage user accounts." });
+      return null;
+    }
+    return { callerUid, callerRole };
+  }
 
   app.post("/api/admin/create-user", async (req, res) => {
     try {
-      const authHeader = req.headers.authorization || "";
-      const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-      if (!idToken) {
-        return res.status(401).json({ error: "Missing sign-in token." });
-      }
-
       const adminAuth = getAdminAuth();
       const adminDb = getAdminDb();
+      const caller = await requireExecCaller(req, res, adminDb, adminAuth);
+      if (!caller) return;
 
-      const decoded = await adminAuth.verifyIdToken(idToken);
-      const callerUid = decoded.uid;
-      const callerDoc = await adminDb.collection("users").doc(callerUid).get();
-      const callerRole = callerDoc.exists ? callerDoc.data()?.roleType : null;
-
-      if (!callerRole || !EXEC_ROLES.includes(callerRole)) {
-        return res.status(403).json({ error: "You do not have permission to create logins." });
-      }
-
-      const { email, password, roleType, displayName } = req.body || {};
+      const { email, password, roleType, displayName, classId } = req.body || {};
       if (!email || !password || !roleType) {
         return res.status(400).json({ error: "email, password, and roleType are required." });
       }
@@ -288,6 +298,9 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
       }
       if (!ASSIGNABLE_ROLES.includes(roleType)) {
         return res.status(400).json({ error: "Invalid role." });
+      }
+      if ((roleType === "TEACHER" || roleType === "CLASS_SECRETARY") && !classId) {
+        return res.status(400).json({ error: "A class must be selected for a Teacher or Class Secretary login." });
       }
 
       const newUser = await adminAuth.createUser({
@@ -300,7 +313,9 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
         roleType,
         email: newUser.email,
         displayName: displayName || null,
-        createdBy: callerUid,
+        classId: classId || null,
+        status: "ACTIVE",
+        createdBy: caller.callerUid,
         createdAt: new Date().toISOString(),
       });
 
@@ -315,27 +330,211 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
     }
   });
 
+  app.get("/api/admin/list-users", async (req, res) => {
+    try {
+      const adminAuth = getAdminAuth();
+      const adminDb = getAdminDb();
+      const caller = await requireExecCaller(req, res, adminDb, adminAuth);
+      if (!caller) return;
+
+      const snapshot = await adminDb.collection("users").get();
+      const users = snapshot.docs.map((d: any) => ({ uid: d.id, ...d.data() }));
+      res.json({ success: true, users });
+    } catch (err: any) {
+      console.error("list-users error:", err);
+      res.status(500).json({ error: err?.message || "Failed to load users." });
+    }
+  });
+
+  app.post("/api/admin/update-user", async (req, res) => {
+    try {
+      const adminAuth = getAdminAuth();
+      const adminDb = getAdminDb();
+      const caller = await requireExecCaller(req, res, adminDb, adminAuth);
+      if (!caller) return;
+
+      const { targetUid, roleType, classId, displayName } = req.body || {};
+      if (!targetUid) return res.status(400).json({ error: "targetUid is required." });
+      if (targetUid === caller.callerUid) {
+        return res.status(400).json({ error: "You cannot edit your own account from here." });
+      }
+
+      const targetRef = adminDb.collection("users").doc(targetUid);
+      const targetDoc = await targetRef.get();
+      if (!targetDoc.exists) return res.status(404).json({ error: "User not found." });
+      const targetData = targetDoc.data() as any;
+
+      if (PROTECTED_ROLES.includes(targetData.roleType)) {
+        return res.status(403).json({
+          error: "General Superintendent and General Secretary accounts cannot be edited here.",
+        });
+      }
+      if (roleType && !ASSIGNABLE_ROLES.includes(roleType)) {
+        return res.status(400).json({ error: "Invalid role." });
+      }
+      if (roleType && PROTECTED_ROLES.includes(roleType)) {
+        return res.status(403).json({
+          error: "Use Firebase Console to grant General Superintendent / General Secretary access.",
+        });
+      }
+
+      const updates: Record<string, any> = { updatedAt: new Date().toISOString() };
+      if (roleType) updates.roleType = roleType;
+      if (classId !== undefined) updates.classId = classId || null;
+      if (displayName !== undefined) updates.displayName = displayName || null;
+
+      await targetRef.update(updates);
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error("update-user error:", err);
+      res.status(500).json({ error: err?.message || "Failed to update user." });
+    }
+  });
+
+  app.post("/api/admin/set-user-status", async (req, res) => {
+    try {
+      const adminAuth = getAdminAuth();
+      const adminDb = getAdminDb();
+      const caller = await requireExecCaller(req, res, adminDb, adminAuth);
+      if (!caller) return;
+
+      const { targetUid, status } = req.body || {};
+      if (!targetUid || !["ACTIVE", "DEACTIVATED"].includes(status)) {
+        return res.status(400).json({ error: "targetUid and a valid status are required." });
+      }
+      if (targetUid === caller.callerUid) {
+        return res.status(400).json({ error: "You cannot deactivate your own account." });
+      }
+
+      const targetRef = adminDb.collection("users").doc(targetUid);
+      const targetDoc = await targetRef.get();
+      if (!targetDoc.exists) return res.status(404).json({ error: "User not found." });
+      const targetData = targetDoc.data() as any;
+
+      if (PROTECTED_ROLES.includes(targetData.roleType)) {
+        return res.status(403).json({
+          error: "General Superintendent and General Secretary accounts cannot be deactivated.",
+        });
+      }
+
+      await targetRef.update({ status, updatedAt: new Date().toISOString() });
+
+      await adminDb.collection("auditLogs").add({
+        action: status === "DEACTIVATED" ? "USER_DEACTIVATED" : "USER_REACTIVATED",
+        performedByUid: caller.callerUid,
+        performedByRole: caller.callerRole,
+        targetUid,
+        targetEmail: targetData.email || null,
+        targetRole: targetData.roleType || null,
+        timestamp: FieldValue.serverTimestamp(),
+        status: "SUCCESS",
+      });
+
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error("set-user-status error:", err);
+      res.status(500).json({ error: err?.message || "Failed to update user status." });
+    }
+  });
+
+  app.post("/api/admin/delete-user-permanently", async (req, res) => {
+    try {
+      const adminAuth = getAdminAuth();
+      const adminDb = getAdminDb();
+      const caller = await requireExecCaller(req, res, adminDb, adminAuth);
+      if (!caller) return;
+
+      const { targetUid } = req.body || {};
+      if (!targetUid) return res.status(400).json({ error: "targetUid is required." });
+      if (targetUid === caller.callerUid) {
+        return res.status(400).json({ error: "You cannot delete your own account." });
+      }
+
+      const targetRef = adminDb.collection("users").doc(targetUid);
+      const targetDoc = await targetRef.get();
+      if (!targetDoc.exists) return res.status(404).json({ error: "User not found." });
+      const targetData = targetDoc.data() as any;
+
+      if (PROTECTED_ROLES.includes(targetData.roleType)) {
+        return res.status(403).json({
+          error: "General Superintendent and General Secretary accounts can never be permanently deleted.",
+        });
+      }
+
+      await adminDb
+        .collection("formerUsers")
+        .doc(targetUid)
+        .set({
+          uid: targetUid,
+          email: targetData.email || null,
+          displayName: targetData.displayName || null,
+          roleType: targetData.roleType || null,
+          classId: targetData.classId || null,
+          deletedBy: caller.callerUid,
+          deletedAt: FieldValue.serverTimestamp(),
+        });
+
+      await targetRef.delete();
+
+      try {
+        await adminAuth.deleteUser(targetUid);
+      } catch (authErr: any) {
+        console.warn("delete-user-permanently: auth deleteUser warning:", authErr?.message);
+      }
+
+      await adminDb.collection("auditLogs").add({
+        action: "USER_ACCOUNT_DELETED",
+        performedByUid: caller.callerUid,
+        performedByRole: caller.callerRole,
+        targetUid,
+        targetEmail: targetData.email || null,
+        targetRole: targetData.roleType || null,
+        timestamp: FieldValue.serverTimestamp(),
+        status: "SUCCESS",
+      });
+
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error("delete-user-permanently error:", err);
+      res.status(500).json({ error: err?.message || "Failed to delete user." });
+    }
+  });
+
   // -----------------------------------------------------------------------
   // Admin: Reset / "Start New Year" — kept in sync with the same endpoint in
   // src/server/app.ts (see the comment there for the full rationale). Scope:
-  //   PRESERVED (identity/config, never touched) — users, adminProfiles,
-  //     departments, workerCategories, clockInConfig. The class list itself
-  //     (className) and worker directory entries (fullName, phone,
-  //     qrCodeToken, status, etc.) also persist as records.
+  //   PRESERVED (identity/config, never touched) — the `users` collection
+  //     (Firebase Auth exec accounts used for authorization — NOT reset
+  //     here, see note below), departments, workerCategories,
+  //     clockInConfig. The class list (className) and worker directory
+  //     entries (fullName, phone, qrCodeToken, status, etc.) also persist.
+  //   RESET (office login deleted entirely) — every `adminProfiles` doc
+  //     (GS, GSec, Treasurer, Record Secretary). Deleted rather than merely
+  //     cleared, since the app's existing "claim this office" screen
+  //     already appears whenever a role has no profile and requires a
+  //     brand-new password. A snapshot (role, title, name — never the
+  //     password) is saved to the archive first.
   //   CLEARED (assignment fields only, record kept) — on every class:
   //     secretaryName, secretaryPhone, teachers, passwordHash, and
   //     isSetupComplete (forces the first-run setup screen next time the
   //     class is opened, so a brand-new password must be set — the outgoing
   //     secretary's password is never reused); on every worker:
   //     assignedClass, duty, categories. Snapshotted to the archive first.
-  //   ARCHIVED then RESET — sundaySchoolYear (copied to
-  //     sundaySchoolYearArchive, along with the class/worker assignment
-  //     snapshot, before the current doc is replaced).
-  //   RESET (cleared) — members, grades, offerings, absenceLogs, referrals,
+  //   ARCHIVED, NEVER DELETED — sundaySchoolYear (copied to
+  //     sundaySchoolYearArchive, along with the class/worker/admin-office
+  //     assignment snapshots, before the current doc is replaced). Every
+  //     document in members, grades, offerings, absenceLogs, referrals,
   //     workerAttendance, workerPrepAttendance, specialEvents,
-  //     specialEventAttendance, adminComments, treasuryExpenditures, lessons.
+  //     specialEventAttendance, adminComments, treasuryExpenditures, and
+  //     lessons is MOVED (never hard-deleted) into
+  //     `yearArchives/{outgoingYearId}/{collectionName}/{docId}`.
+  //
+  // GENERAL_SUPERINTENDENT and GENERAL_SECRETARY are equally authorized to
+  // run this reset, and their own adminProfiles/users accounts are NEVER
+  // touched by it, no matter who runs it — see deleteNonProtectedAdminProfiles
+  // below and PROTECTED_ROLES above.
   // -----------------------------------------------------------------------
-  const RESET_AUTHORIZED_ROLES = ["SUPER_ADMIN", "GENERAL_SUPERINTENDENT"];
+  const RESET_AUTHORIZED_ROLES = ["SUPER_ADMIN", "GENERAL_SUPERINTENDENT", "GENERAL_SECRETARY"];
   const YEAR_RESET_COLLECTIONS = [
     "members",
     "grades",
@@ -351,19 +550,26 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
     "lessons",
   ];
 
-  async function deleteAllDocsInCollection(db: any, collectionName: string, batchSize = 450): Promise<number> {
+  // Moves every document in a live operational collection into
+  // `yearArchives/{yearId}/{collectionName}/{docId}` and only THEN deletes it
+  // from the live collection — nothing is ever permanently lost.
+  async function archiveAndClearCollection(db: any, collectionName: string, yearId: string, batchSize = 400): Promise<number> {
     const collRef = db.collection(collectionName);
-    let totalDeleted = 0;
+    let totalMoved = 0;
     while (true) {
       const snapshot = await collRef.limit(batchSize).get();
       if (snapshot.empty) break;
       const batch = db.batch();
-      snapshot.docs.forEach((doc: any) => batch.delete(doc.ref));
+      snapshot.docs.forEach((doc: any) => {
+        const archiveRef = db.collection("yearArchives").doc(yearId).collection(collectionName).doc(doc.id);
+        batch.set(archiveRef, doc.data());
+        batch.delete(doc.ref);
+      });
       await batch.commit();
-      totalDeleted += snapshot.size;
+      totalMoved += snapshot.size;
       if (snapshot.size < batchSize) break;
     }
-    return totalDeleted;
+    return totalMoved;
   }
 
   // Clears specific fields on every document in a collection WITHOUT
@@ -388,6 +594,22 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
       updated += chunk.length;
     }
     return { updated };
+  }
+
+  // Deletes only the adminProfiles docs that are safe to reset — NEVER a
+  // GENERAL_SUPERINTENDENT or GENERAL_SECRETARY profile.
+  async function deleteNonProtectedAdminProfiles(db: any): Promise<number> {
+    const snapshot = await db.collection("adminProfiles").get();
+    const deletable = snapshot.docs.filter((doc: any) => !PROTECTED_ROLES.includes(doc.data()?.roleType));
+    let deleted = 0;
+    for (let i = 0; i < deletable.length; i += 450) {
+      const chunk = deletable.slice(i, i + 450);
+      const batch = db.batch();
+      chunk.forEach((doc: any) => batch.delete(doc.ref));
+      await batch.commit();
+      deleted += chunk.length;
+    }
+    return deleted;
   }
 
   app.post("/api/admin/reset-year", async (req, res) => {
@@ -447,8 +669,8 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
       });
 
       // 1. Preserve: archive the full outgoing year record, plus a snapshot
-      // of who currently holds each class and each worker's duty role,
-      // before touching anything else.
+      // of who currently holds each class, each worker's duty role, and
+      // each admin office, before touching anything else.
       const classesSnapshotDocs = await adminDb.collection("classes").get();
       const classAssignmentsSnapshot = classesSnapshotDocs.docs.map((d: any) => {
         const c = d.data();
@@ -473,6 +695,17 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
         };
       });
 
+      const adminProfilesSnapshotDocs = await adminDb.collection("adminProfiles").get();
+      const adminProfileAssignmentsSnapshot = adminProfilesSnapshotDocs.docs.map((d: any) => {
+        const a = d.data();
+        return {
+          roleType: a.roleType,
+          title: a.title,
+          profileName: a.profileName,
+          username: a.username,
+        };
+      });
+
       await adminDb
         .collection("sundaySchoolYearArchive")
         .doc(currentYearDoc.id)
@@ -482,15 +715,22 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
           archivedBy: callerUid,
           classAssignmentsSnapshot,
           workerAssignmentsSnapshot,
+          adminProfileAssignmentsSnapshot,
         });
 
-      // 2. Reset only year-specific operational data. Users, adminProfiles,
-      // departments, workerCategories, and clockInConfig are deliberately
-      // never touched by this loop.
-      const deletedCounts: Record<string, number> = {};
+      // 2. Move year-specific operational data into the permanent archive
+      // for this outgoing year, then clear it from the live collections.
+      // Users, departments, workerCategories, and clockInConfig are
+      // deliberately never touched.
+      const archivedCounts: Record<string, number> = {};
       for (const collectionName of YEAR_RESET_COLLECTIONS) {
-        deletedCounts[collectionName] = await deleteAllDocsInCollection(adminDb, collectionName);
+        archivedCounts[collectionName] = await archiveAndClearCollection(adminDb, collectionName, currentYearDoc.id);
       }
+
+      // 2c. Reset non-protected officer logins by deleting their
+      // adminProfiles doc — GENERAL_SUPERINTENDENT and GENERAL_SECRETARY are
+      // always skipped, see the note above.
+      const adminProfilesReset = await deleteNonProtectedAdminProfiles(adminDb);
 
       // 2b. Clear only the YEAR ASSIGNMENT fields on classes and workers —
       // the class login and the worker's directory record both survive
@@ -545,7 +785,7 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
           status: "COMPLETED",
           newYearId,
           newYearName: newYearDoc.yearName,
-          deletedCounts,
+          archivedCounts,
           classesReassigned: classesCleared.updated,
           workersReassigned: workersCleared.updated,
           completedAt: FieldValue.serverTimestamp(),
@@ -557,7 +797,7 @@ ${teacherName || "GOFAMINT_HOF Sunday School Team"} 🙏📖✨`,
         success: true,
         newYearId,
         newYearName: newYearDoc.yearName,
-        deletedCounts,
+        archivedCounts,
         classesReassigned: classesCleared.updated,
         workersReassigned: workersCleared.updated,
       });

@@ -219,29 +219,39 @@ Provide:
     "CLASS_SECRETARY",
     "WORKER",
   ];
+  // GENERAL_SUPERINTENDENT and GENERAL_SECRETARY accounts are permanent: no
+  // endpoint below will deactivate, delete, or change the role of a user
+  // whose CURRENT roleType is one of these, and no one can act on their own
+  // account through these endpoints either (self-deactivate/self-delete/
+  // self-demote is always blocked, for every role, not just these two).
+  const PROTECTED_ROLES = ["SUPER_ADMIN", "GENERAL_SUPERINTENDENT", "GENERAL_SECRETARY"];
+
+  async function requireExecCaller(req: express.Request, res: express.Response, adminDb: FirebaseFirestore.Firestore, adminAuth: import("firebase-admin/auth").Auth) {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) {
+      res.status(401).json({ error: "Missing sign-in token." });
+      return null;
+    }
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const callerUid = decoded.uid;
+    const callerDoc = await adminDb.collection("users").doc(callerUid).get();
+    const callerRole = callerDoc.exists ? callerDoc.data()?.roleType : null;
+    if (!callerRole || !EXEC_ROLES.includes(callerRole)) {
+      res.status(403).json({ error: "You do not have permission to manage user accounts." });
+      return null;
+    }
+    return { callerUid, callerRole };
+  }
 
   app.post("/api/admin/create-user", async (req, res) => {
     try {
-      const authHeader = req.headers.authorization || "";
-      const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-      if (!idToken) {
-        return res.status(401).json({ error: "Missing sign-in token." });
-      }
-
       const adminAuth = getAdminAuth();
       const adminDb = getAdminDb();
+      const caller = await requireExecCaller(req, res, adminDb, adminAuth);
+      if (!caller) return;
 
-      const decoded = await adminAuth.verifyIdToken(idToken);
-      const callerUid = decoded.uid;
-
-      const callerDoc = await adminDb.collection("users").doc(callerUid).get();
-      const callerRole = callerDoc.exists ? callerDoc.data()?.roleType : null;
-
-      if (!callerRole || !EXEC_ROLES.includes(callerRole)) {
-        return res.status(403).json({ error: "You do not have permission to create logins." });
-      }
-
-      const { email, password, roleType, displayName } = req.body || {};
+      const { email, password, roleType, displayName, classId } = req.body || {};
       if (!email || !password || !roleType) {
         return res.status(400).json({ error: "email, password, and roleType are required." });
       }
@@ -250,6 +260,9 @@ Provide:
       }
       if (!ASSIGNABLE_ROLES.includes(roleType)) {
         return res.status(400).json({ error: "Invalid role." });
+      }
+      if ((roleType === "TEACHER" || roleType === "CLASS_SECRETARY") && !classId) {
+        return res.status(400).json({ error: "A class must be selected for a Teacher or Class Secretary login." });
       }
 
       const newUser = await adminAuth.createUser({
@@ -262,7 +275,9 @@ Provide:
         roleType,
         email: newUser.email,
         displayName: displayName || null,
-        createdBy: callerUid,
+        classId: classId || null,
+        status: "ACTIVE",
+        createdBy: caller.callerUid,
         createdAt: new Date().toISOString(),
       });
 
@@ -277,19 +292,226 @@ Provide:
     }
   });
 
+  // List every staff login for the User Management screen.
+  app.get("/api/admin/list-users", async (req, res) => {
+    try {
+      const adminAuth = getAdminAuth();
+      const adminDb = getAdminDb();
+      const caller = await requireExecCaller(req, res, adminDb, adminAuth);
+      if (!caller) return;
+
+      const snapshot = await adminDb.collection("users").get();
+      const users = snapshot.docs.map((d) => ({ uid: d.id, ...d.data() }));
+      res.json({ success: true, users });
+    } catch (err: any) {
+      console.error("list-users error:", err);
+      res.status(500).json({ error: err?.message || "Failed to load users." });
+    }
+  });
+
+  // Edit an existing login's role, class assignment, or display name.
+  // Cannot be used to change the role of a currently-protected account
+  // (GS/GSec), and cannot be used by anyone to edit their own account (to
+  // prevent accidental self-lockout via a mistaken role change).
+  app.post("/api/admin/update-user", async (req, res) => {
+    try {
+      const adminAuth = getAdminAuth();
+      const adminDb = getAdminDb();
+      const caller = await requireExecCaller(req, res, adminDb, adminAuth);
+      if (!caller) return;
+
+      const { targetUid, roleType, classId, displayName } = req.body || {};
+      if (!targetUid) return res.status(400).json({ error: "targetUid is required." });
+      if (targetUid === caller.callerUid) {
+        return res.status(400).json({ error: "You cannot edit your own account from here." });
+      }
+
+      const targetRef = adminDb.collection("users").doc(targetUid);
+      const targetDoc = await targetRef.get();
+      if (!targetDoc.exists) return res.status(404).json({ error: "User not found." });
+      const targetData = targetDoc.data() as any;
+
+      if (PROTECTED_ROLES.includes(targetData.roleType)) {
+        return res.status(403).json({
+          error: "General Superintendent and General Secretary accounts cannot be edited here.",
+        });
+      }
+      if (roleType && !ASSIGNABLE_ROLES.includes(roleType)) {
+        return res.status(400).json({ error: "Invalid role." });
+      }
+      if (roleType && PROTECTED_ROLES.includes(roleType)) {
+        return res.status(403).json({
+          error: "Use Firebase Console to grant General Superintendent / General Secretary access.",
+        });
+      }
+
+      const updates: Record<string, any> = { updatedAt: new Date().toISOString() };
+      if (roleType) updates.roleType = roleType;
+      if (classId !== undefined) updates.classId = classId || null;
+      if (displayName !== undefined) updates.displayName = displayName || null;
+
+      await targetRef.update(updates);
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error("update-user error:", err);
+      res.status(500).json({ error: err?.message || "Failed to update user." });
+    }
+  });
+
+  // Toggle a login between ACTIVE and DEACTIVATED. A deactivated user keeps
+  // their historical records and audit trail — they simply cannot sign in
+  // (checked client-side right after Firebase Auth succeeds, and enforced
+  // again by firestore.rules so a deactivated account can't read/write
+  // anything even with a still-valid Firebase session).
+  app.post("/api/admin/set-user-status", async (req, res) => {
+    try {
+      const adminAuth = getAdminAuth();
+      const adminDb = getAdminDb();
+      const caller = await requireExecCaller(req, res, adminDb, adminAuth);
+      if (!caller) return;
+
+      const { targetUid, status } = req.body || {};
+      if (!targetUid || !["ACTIVE", "DEACTIVATED"].includes(status)) {
+        return res.status(400).json({ error: "targetUid and a valid status are required." });
+      }
+      if (targetUid === caller.callerUid) {
+        return res.status(400).json({ error: "You cannot deactivate your own account." });
+      }
+
+      const targetRef = adminDb.collection("users").doc(targetUid);
+      const targetDoc = await targetRef.get();
+      if (!targetDoc.exists) return res.status(404).json({ error: "User not found." });
+      const targetData = targetDoc.data() as any;
+
+      if (PROTECTED_ROLES.includes(targetData.roleType)) {
+        return res.status(403).json({
+          error: "General Superintendent and General Secretary accounts cannot be deactivated.",
+        });
+      }
+
+      await targetRef.update({ status, updatedAt: new Date().toISOString() });
+
+      await adminDb.collection("auditLogs").add({
+        action: status === "DEACTIVATED" ? "USER_DEACTIVATED" : "USER_REACTIVATED",
+        performedByUid: caller.callerUid,
+        performedByRole: caller.callerRole,
+        targetUid,
+        targetEmail: targetData.email || null,
+        targetRole: targetData.roleType || null,
+        timestamp: FieldValue.serverTimestamp(),
+        status: "SUCCESS",
+      });
+
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error("set-user-status error:", err);
+      res.status(500).json({ error: err?.message || "Failed to update user status." });
+    }
+  });
+
+  // Permanently deletes a Firebase Authentication account. The person's
+  // historical involvement (name, role, email — never their password) is
+  // preserved in `formerUsers` first, and every attendance/grade/offering
+  // record they were ever tied to is untouched — those records reference
+  // the church member/worker/class, not this login, so deleting the login
+  // never deletes church history (see REQUIREMENT 13/27 in the church
+  // admin's own spec for this feature).
+  app.post("/api/admin/delete-user-permanently", async (req, res) => {
+    try {
+      const adminAuth = getAdminAuth();
+      const adminDb = getAdminDb();
+      const caller = await requireExecCaller(req, res, adminDb, adminAuth);
+      if (!caller) return;
+
+      const { targetUid } = req.body || {};
+      if (!targetUid) return res.status(400).json({ error: "targetUid is required." });
+      if (targetUid === caller.callerUid) {
+        return res.status(400).json({ error: "You cannot delete your own account." });
+      }
+
+      const targetRef = adminDb.collection("users").doc(targetUid);
+      const targetDoc = await targetRef.get();
+      if (!targetDoc.exists) return res.status(404).json({ error: "User not found." });
+      const targetData = targetDoc.data() as any;
+
+      if (PROTECTED_ROLES.includes(targetData.roleType)) {
+        return res.status(403).json({
+          error: "General Superintendent and General Secretary accounts can never be permanently deleted.",
+        });
+      }
+
+      await adminDb
+        .collection("formerUsers")
+        .doc(targetUid)
+        .set({
+          uid: targetUid,
+          email: targetData.email || null,
+          displayName: targetData.displayName || null,
+          roleType: targetData.roleType || null,
+          classId: targetData.classId || null,
+          deletedBy: caller.callerUid,
+          deletedAt: FieldValue.serverTimestamp(),
+        });
+
+      await targetRef.delete();
+
+      try {
+        await adminAuth.deleteUser(targetUid);
+      } catch (authErr: any) {
+        // The Firestore side is already cleaned up; if the Auth account was
+        // already gone (or something odd happened) that's fine — log it
+        // rather than fail the whole request, since the user-facing goal
+        // (this person can no longer sign in or appear as active staff) is
+        // already achieved.
+        console.warn("delete-user-permanently: auth deleteUser warning:", authErr?.message);
+      }
+
+      await adminDb.collection("auditLogs").add({
+        action: "USER_ACCOUNT_DELETED",
+        performedByUid: caller.callerUid,
+        performedByRole: caller.callerRole,
+        targetUid,
+        targetEmail: targetData.email || null,
+        targetRole: targetData.roleType || null,
+        timestamp: FieldValue.serverTimestamp(),
+        status: "SUCCESS",
+      });
+
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error("delete-user-permanently error:", err);
+      res.status(500).json({ error: err?.message || "Failed to delete user." });
+    }
+  });
+
   // -----------------------------------------------------------------------
-  // Admin: Reset / "Start New Year" — archives + clears operational data for
-  // the current Sunday School year against the centralized Firestore
+  // Admin: Reset / "Start New Year" — archives (never deletes) the current
+  // church year's operational data against the centralized Firestore
   // database, and rotates in a fresh year. Server-side only: authorization is
   // verified here against the caller's real Firestore role doc (never trusts
   // anything the browser claims), exactly like /api/admin/create-user above.
+  // GENERAL_SUPERINTENDENT and GENERAL_SECRETARY are equally authorized to
+  // run this — neither outranks the other for this or any other permission.
   //
   // Scope (derived from src/types.ts / firestore.rules, and confirmed with
   // the church admin — not guessed):
-  //   PRESERVED (identity/config, never touched) — users, adminProfiles,
-  //     departments, workerCategories, clockInConfig. The class list itself
-  //     (className) and worker directory entries (fullName, phone,
-  //     qrCodeToken, status, etc.) also persist as records.
+  //   PRESERVED, NEVER TOUCHED — the `users` collection entirely (every
+  //     Firebase-Auth-linked login, of any role), departments,
+  //     workerCategories, clockInConfig. The class list itself (className)
+  //     and worker directory entries (fullName, phone, qrCodeToken, status,
+  //     etc.) also persist as records — see REQUIREMENT 5/11/18 in the
+  //     church admin's own spec: Super Admin accounts must survive every
+  //     reset, and worker identities carry forward.
+  //   RESET (office login deleted entirely, GS/GSec SKIPPED) — every
+  //     `adminProfiles` doc EXCEPT ones whose roleType is
+  //     GENERAL_SUPERINTENDENT or GENERAL_SECRETARY — those two are never
+  //     touched, no matter who is running this reset. Every other office's
+  //     password was chosen by whoever held it, so it is deleted rather than
+  //     merely cleared — the app's existing "claim this office" screen
+  //     already appears automatically whenever a role has no profile, and
+  //     requires a brand-new password. A snapshot of who held each office
+  //     (role, title, name — never the password) is saved to the archive
+  //     first.
   //   CLEARED (assignment fields only, record kept) — on every class:
   //     secretaryName, secretaryPhone, teachers, passwordHash, and
   //     isSetupComplete (this forces the app's own first-run setup screen
@@ -299,31 +521,52 @@ Provide:
   //     (their current duty role). A snapshot of the pre-clear class/worker
   //     assignments is saved to the archive first, so who held what last
   //     year is never lost.
-  //   ARCHIVED then RESET — the outgoing `sundaySchoolYear` document is
+  //   ARCHIVED, NEVER DELETED — the outgoing `sundaySchoolYear` document is
   //     copied into `sundaySchoolYearArchive` before anything else happens,
-  //     alongside the class/worker assignment snapshot above.
-  //   RESET (cleared) — members, grades, offerings, absenceLogs, referrals,
-  //     workerAttendance, workerPrepAttendance, specialEvents,
-  //     specialEventAttendance, adminComments, treasuryExpenditures, lessons
-  //     — the year-specific operational records these types represent
-  //     (see YEAR_RESET_COLLECTIONS below).
+  //     alongside the class/worker/admin-office assignment snapshots above.
+  //     Separately, every document in members, grades, offerings,
+  //     absenceLogs, referrals, workerAttendance, workerPrepAttendance,
+  //     specialEvents, specialEventAttendance, adminComments,
+  //     treasuryExpenditures, and lessons (see YEAR_RESET_COLLECTIONS below)
+  //     is MOVED — not deleted — into
+  //     `yearArchives/{outgoingYearId}/{collectionName}/{docId}` via
+  //     archiveAndClearCollection(). The live collections end up exactly as
+  //     empty as a hard delete would leave them (so nothing else in the app
+  //     needs to change how it queries "current" data), but every record
+  //     from every past year remains permanently readable under
+  //     `yearArchives/{yearId}` for reporting, comparison, and export.
   //
   // Firestore has no single multi-thousand-document ACID transaction, so
   // atomicity is approximated deliberately in this order: (1) archive the
-  // outgoing year and current class/worker assignments first — cheap and
-  // safe, guarantees history is never lost; (2) clear operational
-  // collections; (3) clear class/worker assignment fields; (4) write the new
-  // year document; (5) only then delete the old year document, so the
+  // outgoing year and current class/worker/admin-office assignments first —
+  // cheap and safe, guarantees history is never lost; (2) move operational
+  // collections into yearArchives; (3) delete non-protected admin-office
+  // logins; (4) clear class/worker assignment fields; (5) write the new year
+  // document; (6) only then delete the old year document, so the
   // `sundaySchoolYear` collection is never left empty. Every step here is a
-  // no-op when re-run (deleting an already-deleted doc, re-archiving the
-  // same doc, clearing already-blank fields, etc.), so if a failure happens
+  // no-op when re-run (moving an already-moved doc is harmless — it simply
+  // won't be found in the live collection anymore and the loop ends;
+  // deleting an already-deleted doc, re-archiving the same doc, clearing
+  // already-blank fields, etc. are all no-ops too), so if a failure happens
   // partway through, simply calling this endpoint again with the same
   // request safely finishes the job instead of corrupting state — the
   // practical equivalent of a rollback-and-retry for an operation this size.
   // Every attempt (success or failure) is written to `auditLogs` before the
   // destructive work starts and updated with the final outcome.
+  //
+  // NOTE on the person performing this reset: if they hold a
+  // non-GS/GSec office (e.g. Treasurer), their adminProfiles doc IS deleted
+  // along with everyone else's in that category, but this does NOT
+  // interrupt the reset itself — their current browser session already
+  // holds their profile in memory, and this endpoint's own authorization
+  // check runs off their Firebase Auth ID token (the `users` collection),
+  // not the adminProfiles doc. If they hold GS or GSec, their profile (and
+  // their `users` login) is never touched at all. The only effect on
+  // non-GS/GSec staff is on their NEXT sign-in: they re-claim their office
+  // with a brand-new password, via the same self-service screen everyone
+  // else uses.
   // -----------------------------------------------------------------------
-  const RESET_AUTHORIZED_ROLES = ["SUPER_ADMIN", "GENERAL_SUPERINTENDENT"];
+  const RESET_AUTHORIZED_ROLES = ["SUPER_ADMIN", "GENERAL_SUPERINTENDENT", "GENERAL_SECRETARY"];
   const YEAR_RESET_COLLECTIONS = [
     "members",
     "grades",
@@ -339,25 +582,36 @@ Provide:
     "lessons",
   ];
 
-  async function deleteAllDocsInCollection(
+  // Moves every document in a live operational collection into
+  // `yearArchives/{yearId}/{collectionName}/{docId}` and only THEN deletes it
+  // from the live collection. This is the non-destructive alternative to
+  // deleteAllDocsInCollection: nothing is ever permanently lost — the
+  // General Superintendent can browse `yearArchives/{yearId}` for any past
+  // year in full, forever. The live collections (members, grades, offerings,
+  // etc.) stay exactly as clean as a hard delete would leave them, so
+  // nothing else in the app needs to change how it queries "current" data.
+  async function archiveAndClearCollection(
     db: FirebaseFirestore.Firestore,
     collectionName: string,
-    batchSize = 450
+    yearId: string,
+    batchSize = 400 // leaves headroom since this does 2 writes (copy+delete) per doc per batch
   ): Promise<number> {
     const collRef = db.collection(collectionName);
-    let totalDeleted = 0;
-    // Loop rather than a single batch: a collection can hold far more than
-    // Firestore's 500-writes-per-batch limit.
+    let totalMoved = 0;
     while (true) {
       const snapshot = await collRef.limit(batchSize).get();
       if (snapshot.empty) break;
       const batch = db.batch();
-      snapshot.docs.forEach((doc) => batch.delete(doc.ref));
+      snapshot.docs.forEach((doc) => {
+        const archiveRef = db.collection("yearArchives").doc(yearId).collection(collectionName).doc(doc.id);
+        batch.set(archiveRef, doc.data());
+        batch.delete(doc.ref);
+      });
       await batch.commit();
-      totalDeleted += snapshot.size;
+      totalMoved += snapshot.size;
       if (snapshot.size < batchSize) break;
     }
-    return totalDeleted;
+    return totalMoved;
   }
 
   // Clears specific fields on every document in a collection WITHOUT
@@ -385,6 +639,23 @@ Provide:
       updated += chunk.length;
     }
     return { updated, snapshot };
+  }
+
+  // Deletes only the adminProfiles docs that are safe to reset — this
+  // NEVER touches a GENERAL_SUPERINTENDENT or GENERAL_SECRETARY profile,
+  // per REQUIREMENT 11 (Super Admin accounts must survive every reset).
+  async function deleteNonProtectedAdminProfiles(db: FirebaseFirestore.Firestore): Promise<number> {
+    const snapshot = await db.collection("adminProfiles").get();
+    const deletable = snapshot.docs.filter((doc) => !PROTECTED_ROLES.includes((doc.data() as any)?.roleType));
+    let deleted = 0;
+    for (let i = 0; i < deletable.length; i += 450) {
+      const chunk = deletable.slice(i, i + 450);
+      const batch = db.batch();
+      chunk.forEach((doc) => batch.delete(doc.ref));
+      await batch.commit();
+      deleted += chunk.length;
+    }
+    return deleted;
   }
 
   app.post("/api/admin/reset-year", async (req, res) => {
@@ -474,6 +745,30 @@ Provide:
         };
       });
 
+      // adminProfiles docs ARE the officer's registration for that office
+      // (GS/GSec/Treasurer/Record) — there is no separate "identity" to
+      // preserve the way a class's className is. So resetting an office's
+      // password means deleting the doc entirely; the app's existing
+      // "claim this office" screen already appears automatically whenever a
+      // role has no profile, and requires a brand-new password to register.
+      // NOTE: this only resets the 4 office passwords stored in
+      // `adminProfiles`. It does NOT touch the separate Firebase
+      // Authentication accounts (the `users` collection this endpoint's own
+      // authorization check reads from) — those are personal logins tied to
+      // an individual's email, not a shared office credential, and rotating
+      // them would need an email-delivery step this app does not currently
+      // have. Ask if those need resetting too before building that.
+      const adminProfilesSnapshotDocs = await adminDb.collection("adminProfiles").get();
+      const adminProfileAssignmentsSnapshot = adminProfilesSnapshotDocs.docs.map((d) => {
+        const a = d.data() as any;
+        return {
+          roleType: a.roleType,
+          title: a.title,
+          profileName: a.profileName,
+          username: a.username,
+        };
+      });
+
       await adminDb
         .collection("sundaySchoolYearArchive")
         .doc(currentYearDoc.id)
@@ -483,15 +778,26 @@ Provide:
           archivedBy: callerUid,
           classAssignmentsSnapshot,
           workerAssignmentsSnapshot,
+          adminProfileAssignmentsSnapshot,
         });
 
-      // 2. Reset only year-specific operational data. Users, adminProfiles,
-      // departments, workerCategories, and clockInConfig are deliberately
-      // never touched by this loop.
-      const deletedCounts: Record<string, number> = {};
+      // 2. Move year-specific operational data into the permanent archive
+      // for this outgoing year, then clear it from the live collections.
+      // Nothing here is ever hard-deleted — see archiveAndClearCollection
+      // above. Users, departments, workerCategories, and clockInConfig are
+      // deliberately never touched by this loop.
+      const archivedCounts: Record<string, number> = {};
       for (const collectionName of YEAR_RESET_COLLECTIONS) {
-        deletedCounts[collectionName] = await deleteAllDocsInCollection(adminDb, collectionName);
+        archivedCounts[collectionName] = await archiveAndClearCollection(adminDb, collectionName, currentYearDoc.id);
       }
+
+      // 2c. Reset officer logins (Asst. General Secretary, Treasurer,
+      // Record Officer, etc.) by deleting their adminProfiles doc — see the
+      // note above. GENERAL_SUPERINTENDENT and GENERAL_SECRETARY profiles
+      // are explicitly SKIPPED and never touched, per REQUIREMENT 11: those
+      // two accounts must survive every reset untouched, including if the
+      // person performing this very reset holds one of those offices.
+      const adminProfilesReset = await deleteNonProtectedAdminProfiles(adminDb);
 
       // 2b. Clear only the YEAR ASSIGNMENT fields on classes and workers.
       // For classes this INCLUDES the password: the outgoing secretary chose
@@ -559,9 +865,10 @@ Provide:
           status: "COMPLETED",
           newYearId,
           newYearName: newYearDoc.yearName,
-          deletedCounts,
+          archivedCounts,
           classesReassigned: classesCleared.updated,
           workersReassigned: workersCleared.updated,
+          adminProfilesReset,
           completedAt: FieldValue.serverTimestamp(),
         },
         { merge: true }
@@ -571,9 +878,10 @@ Provide:
         success: true,
         newYearId,
         newYearName: newYearDoc.yearName,
-        deletedCounts,
+        archivedCounts,
         classesReassigned: classesCleared.updated,
         workersReassigned: workersCleared.updated,
+        adminProfilesReset,
       });
     } catch (err: any) {
       console.error("reset-year error:", err);

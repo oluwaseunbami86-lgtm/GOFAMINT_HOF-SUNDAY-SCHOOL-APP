@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { Lock, Church, AlertCircle } from 'lucide-react';
+import { Lock, AlertCircle } from 'lucide-react';
 import { signIn } from '../services/authService';
+import { GofamintLogo } from './GofamintLogo';
 
 interface CloudLoginGateProps {
   onSignedIn: () => void;
@@ -48,8 +49,8 @@ export const CloudLoginGate: React.FC<CloudLoginGateProps> = ({ onSignedIn }) =>
     <div className="min-h-screen bg-blue-950 flex flex-col items-center justify-center p-4">
       <div className="w-full max-w-sm bg-white rounded-2xl shadow-2xl p-8">
         <div className="flex flex-col items-center mb-6">
-          <div className="w-14 h-14 rounded-full bg-blue-950 flex items-center justify-center mb-3">
-            <Church className="w-7 h-7 text-amber-400" />
+          <div className="mb-3">
+            <GofamintLogo size={64} />
           </div>
           <h1 className="text-lg font-bold text-slate-800 text-center font-['Cinzel',serif]">
             THE GOSPEL FAITH MISSION INTL
