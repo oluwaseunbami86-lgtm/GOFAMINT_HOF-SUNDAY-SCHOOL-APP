@@ -497,6 +497,17 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // 23. Year Archives (the full moved records for a past year, under
+    // yearArchives/{yearId}/{collectionName}/{docId}) — written only by the
+    // server's Admin SDK during a year reset. Restricted to
+    // GENERAL_SUPERINTENDENT / GENERAL_SECRETARY / SUPER_ADMIN: unlike the
+    // lightweight year summary above, this holds full historical member,
+    // grade, and offering records for every past year.
+    match /yearArchives/{yearId}/{collectionName}/{docId} {
+      allow read: if isExecAdmin();
+      allow write: if false;
+    }
+
     // =========================================================================
     // DEFAULT DENY SAFETY NET
     // =========================================================================
