@@ -323,3 +323,23 @@ export const cloudSaveLesson = (lesson: LessonInfo) => saveDocument<any>('lesson
 // /api/admin/reset-year; see firestore.rules).
 export const cloudGetResetAuditLogs = () => fetchCollection<any>('auditLogs');
 export const cloudGetSundaySchoolYearArchive = () => fetchCollection<SundaySchoolYear>('sundaySchoolYearArchive');
+
+// 16. My own `users/{uid}` role record — used right after Firebase sign-in
+// to determine which portal to route into (see App.tsx). Returns null for
+// any signed-in account that predates this feature (legacy class/office
+// logins with no `users/{uid}` doc), so those are left completely
+// unaffected and fall through to the app's original class-picker flow.
+export interface CloudUserRecord {
+  uid: string;
+  roleType: string;
+  email: string | null;
+  displayName: string | null;
+  classId: string | null;
+  status: 'ACTIVE' | 'DEACTIVATED';
+  createdAt?: string;
+}
+export const cloudGetMyUserRecord = async (uid: string): Promise<CloudUserRecord | null> => {
+  const snap = await getDoc(doc(db, 'users', uid));
+  if (!snap.exists()) return null;
+  return { uid, ...(snap.data() as any) };
+};

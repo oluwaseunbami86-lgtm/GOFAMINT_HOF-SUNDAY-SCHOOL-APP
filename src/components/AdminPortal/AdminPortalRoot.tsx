@@ -63,15 +63,37 @@ interface AdminPortalRootProps {
   onBackToPortalSelect: () => void;
   onEnterClassRegister?: () => void;
   onEnterWorkersModule?: () => void;
+  // When provided, this admin is already authenticated via a real Firebase
+  // Auth account with a `users/{uid}` role doc (created through User
+  // Management, not the legacy local claim/password system) — so the local
+  // claim/sign-in screen is skipped entirely and this role is used directly.
+  // Undefined/omitted preserves the exact original behavior for any admin
+  // who doesn't yet have a `users/{uid}` doc (legacy local-password access).
+  firebaseUserRole?: { roleType: AdminRoleType; displayName: string };
 }
 
 export const AdminPortalRoot: React.FC<AdminPortalRootProps> = ({
   onBackToPortalSelect,
   onEnterClassRegister,
-  onEnterWorkersModule
+  onEnterWorkersModule,
+  firebaseUserRole
 }) => {
   const [adminProfiles, setAdminProfiles] = useState<AdminProfile[]>([]);
-  const [currentAdmin, setCurrentAdmin] = useState<AdminProfile | null>(null);
+  const [currentAdmin, setCurrentAdmin] = useState<AdminProfile | null>(() => {
+    if (!firebaseUserRole) return null;
+    const now = new Date().toISOString();
+    return {
+      id: firebaseUserRole.roleType,
+      roleType: firebaseUserRole.roleType,
+      title: firebaseUserRole.roleType.replace(/_/g, ' '),
+      profileName: firebaseUserRole.displayName || firebaseUserRole.roleType.replace(/_/g, ' '),
+      username: firebaseUserRole.roleType.toLowerCase(),
+      passwordHash: '',
+      isApproved: true,
+      createdAt: now,
+      updatedAt: now
+    };
+  });
   const [sundaySchoolYear, setSundaySchoolYear] = useState<SundaySchoolYear | null>(null);
   const [allClasses, setAllClasses] = useState<ClassProfile[]>([]);
   const [loading, setLoading] = useState(true);
@@ -448,7 +470,7 @@ export const AdminPortalRoot: React.FC<AdminPortalRootProps> = ({
         {/* Directorate View Router */}
         <main className="max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex-1">
           {(currentAdmin.roleType === 'GENERAL_SUPERINTENDENT' || currentAdmin.roleType === 'GENERAL_SECRETARY') && (
-            <CloudUserManagementPanel />
+            <CloudUserManagementPanel allClasses={allClasses} />
           )}
 
           {currentAdmin.roleType === 'GENERAL_SUPERINTENDENT' && (
@@ -518,7 +540,7 @@ export const AdminPortalRoot: React.FC<AdminPortalRootProps> = ({
           initialTab={backupModalTab}
           onClose={() => setIsBackupModalOpen(false)}
           onDatabaseRestored={refreshAdminData}
-          canAccessReset={currentAdmin.roleType === 'GENERAL_SUPERINTENDENT'}
+          canAccessReset={currentAdmin.roleType === 'GENERAL_SUPERINTENDENT' || currentAdmin.roleType === 'GENERAL_SECRETARY'}
         />
       </div>
     );
