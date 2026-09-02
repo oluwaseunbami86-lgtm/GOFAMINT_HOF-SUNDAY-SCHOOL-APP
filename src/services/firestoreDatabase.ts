@@ -343,3 +343,17 @@ export const cloudGetMyUserRecord = async (uid: string): Promise<CloudUserRecord
   if (!snap.exists()) return null;
   return { uid, ...(snap.data() as any) };
 };
+
+// 17. Year Archives — reading what a past year's reset moved into
+// `yearArchives/{yearId}/{collectionName}`. Read-only; these are written
+// exclusively by the server's Admin SDK during /api/admin/reset-year.
+export const YEAR_ARCHIVE_COLLECTIONS = [
+  'members', 'grades', 'offerings', 'absenceLogs', 'referrals',
+  'workerAttendance', 'workerPrepAttendance', 'specialEvents',
+  'specialEventAttendance', 'adminComments', 'treasuryExpenditures', 'lessons'
+] as const;
+
+export const cloudGetYearArchiveCollection = async (yearId: string, collectionName: string): Promise<any[]> => {
+  const snap = await getDocs(collection(db, 'yearArchives', yearId, collectionName));
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+};

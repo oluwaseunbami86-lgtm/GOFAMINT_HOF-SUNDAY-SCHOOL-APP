@@ -48,7 +48,7 @@ import { GOFAMINT_HOF_12_LESSONS } from './data/mockQuarterLessons';
 import { pushSyncToServer, pullSyncFromServer } from './services/api';
 import { getConsecutiveAbsences, getConsecutiveVisits } from './utils/calculations';
 import { runFullCloudSyncCycle, getLastHydrationError } from './services/cloudSyncManager';
-import { subscribeToClassGrades, subscribeToClassMembers, cloudGetMyUserRecord } from './services/firestoreDatabase';
+import { subscribeToClassGrades, subscribeToClassMembers, cloudGetMyUserRecord, cloudGetClassProfile } from './services/firestoreDatabase';
 
 // Subcomponents
 import { Header } from './components/Header';
@@ -114,11 +114,35 @@ export default function App() {
           setShowAdminPortal(true);
         } else if (record.roleType === 'WORKER') {
           setShowWorkersModule(true);
+        } else if ((record.roleType === 'TEACHER' || record.roleType === 'CLASS_SECRETARY') && record.classId) {
+          // Auto-enter this class directly — no picker, no password. This
+          // account's identity IS the authorization (a real Firebase login
+          // tied to this specific classId via User Management), so it
+          // replicates exactly what handleUnlockConsole does on a correct
+          // password, rather than introducing a second, divergent code path.
+          try {
+            const theirClass = await cloudGetClassProfile(record.classId);
+            if (theirClass) {
+              if (theirClass.approvalStatus === 'PENDING_APPROVAL') {
+                setDeactivatedMessage(`Your class "${theirClass.className}" is still pending approval from the General Superintendent or General Secretary. Please try again once it has been approved.`);
+              } else {
+                await saveClassProfile(theirClass);
+                setClassProfile(theirClass);
+                setIsUnlocked(true);
+                sessionStorage.setItem('gofamint_unlocked', 'true');
+                sessionStorage.setItem('gofamint_unlocked_class_id', theirClass.id);
+                setShowOpeningPage(false);
+                setActiveTab('GRADING_MATRIX');
+                setSelectedWeek(1);
+                await loadClassQuarterData(theirClass.id, selectedQuarter);
+              }
+            } else {
+              setDeactivatedMessage('Your account is assigned to a class that no longer exists. Please contact the General Superintendent or General Secretary.');
+            }
+          } catch (classErr) {
+            console.error('Failed to auto-load assigned class:', classErr);
+          }
         }
-        // TEACHER / CLASS_SECRETARY: not yet auto-routed to their class —
-        // deliberately left to fall through to the existing class-picker
-        // flow below rather than risk an untested bypass of the class
-        // unlock/data-loading state machine.
         setMyUserRecord({ roleType: record.roleType, displayName: record.displayName });
       } catch (err) {
         console.error('Failed to load user role record:', err);

@@ -25,9 +25,11 @@ import {
   Download,
   Upload,
   Database,
-  Trash2
+  Trash2,
+  Archive
 } from 'lucide-react';
 import { GofamintLogo } from '../GofamintLogo';
+import { YearArchivesView } from './YearArchivesView';
 import {
   AdminProfile,
   AdminRoleType,
@@ -97,6 +99,7 @@ export const AdminPortalRoot: React.FC<AdminPortalRootProps> = ({
   const [sundaySchoolYear, setSundaySchoolYear] = useState<SundaySchoolYear | null>(null);
   const [allClasses, setAllClasses] = useState<ClassProfile[]>([]);
   const [loading, setLoading] = useState(true);
+  const [showYearArchives, setShowYearArchives] = useState(false);
 
   // Data Backup / Restore Modal State
   const [isBackupModalOpen, setIsBackupModalOpen] = useState(false);
@@ -353,6 +356,14 @@ export const AdminPortalRoot: React.FC<AdminPortalRootProps> = ({
   if (currentAdmin && sundaySchoolYear) {
     const roleDef = PERMITTED_ADMIN_IDS.find(d => d.roleType === currentAdmin.roleType);
 
+    if (showYearArchives) {
+      return (
+        <div className="min-h-screen bg-slate-100">
+          <YearArchivesView currentYear={sundaySchoolYear} onBack={() => setShowYearArchives(false)} />
+        </div>
+      );
+    }
+
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
         
@@ -422,6 +433,19 @@ export const AdminPortalRoot: React.FC<AdminPortalRootProps> = ({
                 <Database className="w-3.5 h-3.5" />
                 <span>Save / Load Data</span>
               </button>
+
+              {/* Year Archives — GS/GSec only, matches equal-authority pattern */}
+              {(currentAdmin.roleType === 'GENERAL_SUPERINTENDENT' || currentAdmin.roleType === 'GENERAL_SECRETARY') && (
+                <button
+                  id="btn-year-archives"
+                  onClick={() => setShowYearArchives(true)}
+                  className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-white rounded-xl text-xs font-black flex items-center gap-1.5 shadow-sm transition cursor-pointer"
+                  title="Browse every past church year's preserved records"
+                >
+                  <Archive className="w-3.5 h-3.5" />
+                  <span>Year Archives</span>
+                </button>
+              )}
 
               {/* Enter Workers Module Jump */}
               {onEnterWorkersModule && (
