@@ -48,7 +48,7 @@ import { GOFAMINT_HOF_12_LESSONS } from './data/mockQuarterLessons';
 import { pushSyncToServer, pullSyncFromServer } from './services/api';
 import { getConsecutiveAbsences, getConsecutiveVisits } from './utils/calculations';
 import { runFullCloudSyncCycle, getLastHydrationError } from './services/cloudSyncManager';
-import { subscribeToClassGrades, subscribeToClassMembers } from './services/firestoreDatabase';
+import { subscribeToClassGrades, subscribeToClassMembers, cloudGetMyUserRecord } from './services/firestoreDatabase';
 
 // Subcomponents
 import { Header } from './components/Header';
@@ -85,6 +85,46 @@ export default function App() {
     });
     return unsubscribe;
   }, []);
+
+  // Role-based routing for accounts created through User Management (i.e.
+  // with a `users/{uid}` Firestore doc). This is purely ADDITIVE: any
+  // signed-in account that predates this feature has no such doc, so
+  // myUserRecord stays null and every existing flow below is completely
+  // unaffected. A deactivated account is signed out immediately rather than
+  // silently allowed to continue on a still-valid Firebase session.
+  const [myUserRecord, setMyUserRecord] = useState<{ roleType: string; displayName: string | null } | null>(null);
+  const [deactivatedMessage, setDeactivatedMessage] = useState<string | null>(null);
+  const ADMIN_TIER_ROLES = ['SUPER_ADMIN', 'GENERAL_SUPERINTENDENT', 'GENERAL_SECRETARY', 'ASST_GENERAL_SECRETARY', 'TREASURER', 'RECORD_OFFICER', 'ENROLLMENT_OFFICER'];
+
+  useEffect(() => {
+    if (!cloudUser) {
+      setMyUserRecord(null);
+      return;
+    }
+    (async () => {
+      try {
+        const record = await cloudGetMyUserRecord(cloudUser.uid);
+        if (!record) return; // legacy account, no users/{uid} doc — unaffected
+        if (record.status === 'DEACTIVATED') {
+          setDeactivatedMessage('This account has been deactivated. Please contact the General Superintendent or General Secretary.');
+          await signOutUser();
+          return;
+        }
+        if (ADMIN_TIER_ROLES.includes(record.roleType)) {
+          setShowAdminPortal(true);
+        } else if (record.roleType === 'WORKER') {
+          setShowWorkersModule(true);
+        }
+        // TEACHER / CLASS_SECRETARY: not yet auto-routed to their class —
+        // deliberately left to fall through to the existing class-picker
+        // flow below rather than risk an untested bypass of the class
+        // unlock/data-loading state machine.
+        setMyUserRecord({ roleType: record.roleType, displayName: record.displayName });
+      } catch (err) {
+        console.error('Failed to load user role record:', err);
+      }
+    })();
+  }, [cloudUser]);
 
   // Global App States
   const [isInitializing, setIsInitializing] = useState(true);
@@ -866,6 +906,18 @@ export default function App() {
     return <CloudLoginGate onSignedIn={() => { /* onAuthStateChanged will update cloudUser */ }} />;
   }
 
+  if (deactivatedMessage) {
+    return (
+      <div className="min-h-screen bg-blue-950 flex flex-col items-center justify-center text-slate-300 p-4 text-center">
+        <div className="w-14 h-14 rounded-full bg-rose-700 flex items-center justify-center mb-4">
+          <span className="text-2xl">🔒</span>
+        </div>
+        <h2 className="text-base font-bold font-['Cinzel',serif] tracking-wide text-white">Account Deactivated</h2>
+        <p className="text-xs text-blue-200 mt-2 max-w-xs">{deactivatedMessage}</p>
+      </div>
+    );
+  }
+
   if (isInitializing) {
     return (
       <div className="min-h-screen bg-blue-950 flex flex-col items-center justify-center text-slate-300 p-4 text-center">
@@ -894,6 +946,11 @@ export default function App() {
   if (showAdminPortal) {
     return (
       <AdminPortalRoot
+        firebaseUserRole={
+          myUserRecord && ADMIN_TIER_ROLES.includes(myUserRecord.roleType)
+            ? { roleType: myUserRecord.roleType as any, displayName: myUserRecord.displayName || '' }
+            : undefined
+        }
         onBackToPortalSelect={() => {
           setShowAdminPortal(false);
           setShowOpeningPage(true);
