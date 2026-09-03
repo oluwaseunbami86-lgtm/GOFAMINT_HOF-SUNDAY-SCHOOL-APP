@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   ActiveTab,
   ClassProfile,
@@ -42,13 +42,14 @@ import {
   saveAdminComment,
   deleteAdminComment,
   getSundaySchoolYear,
-  archiveQuarterForRegister
+  archiveQuarterForRegister,
+  putInStore
 } from './db/indexedDB';
 import { GOFAMINT_HOF_12_LESSONS } from './data/mockQuarterLessons';
 import { pushSyncToServer, pullSyncFromServer } from './services/api';
 import { getConsecutiveAbsences, getConsecutiveVisits } from './utils/calculations';
 import { runFullCloudSyncCycle, getLastHydrationError } from './services/cloudSyncManager';
-import { subscribeToClassGrades, subscribeToClassMembers, cloudGetMyUserRecord, cloudGetClassProfile } from './services/firestoreDatabase';
+import { subscribeToClassGrades, subscribeToClassMembers, subscribeToClassOfferings, subscribeToClassProfile, cloudGetMyUserRecord, cloudGetClassProfile } from './services/firestoreDatabase';
 
 // Subcomponents
 import { Header } from './components/Header';
@@ -95,6 +96,24 @@ export default function App() {
   const [myUserRecord, setMyUserRecord] = useState<{ roleType: string; displayName: string | null } | null>(null);
   const [deactivatedMessage, setDeactivatedMessage] = useState<string | null>(null);
   const ADMIN_TIER_ROLES = ['SUPER_ADMIN', 'GENERAL_SUPERINTENDENT', 'GENERAL_SECRETARY', 'ASST_GENERAL_SECRETARY', 'TREASURER', 'RECORD_OFFICER', 'ENROLLMENT_OFFICER'];
+  const pendingApprovalUnsubRef = useRef<(() => void) | null>(null);
+
+  // Enters a class directly — no picker, no password. Shared by the
+  // initial auto-route below AND by the pending-approval listener, so the
+  // moment a class is approved, whoever is waiting on it is let straight in
+  // without needing to sign out and back in.
+  const enterAssignedClass = async (theirClass: ClassProfile) => {
+    await saveClassProfile(theirClass);
+    setClassProfile(theirClass);
+    setIsUnlocked(true);
+    sessionStorage.setItem('gofamint_unlocked', 'true');
+    sessionStorage.setItem('gofamint_unlocked_class_id', theirClass.id);
+    setShowOpeningPage(false);
+    setActiveTab('GRADING_MATRIX');
+    setSelectedWeek(1);
+    setDeactivatedMessage(null);
+    await loadClassQuarterData(theirClass.id, selectedQuarter);
+  };
 
   useEffect(() => {
     if (!cloudUser) {
@@ -115,26 +134,29 @@ export default function App() {
         } else if (record.roleType === 'WORKER') {
           setShowWorkersModule(true);
         } else if ((record.roleType === 'TEACHER' || record.roleType === 'CLASS_SECRETARY') && record.classId) {
-          // Auto-enter this class directly — no picker, no password. This
-          // account's identity IS the authorization (a real Firebase login
-          // tied to this specific classId via User Management), so it
-          // replicates exactly what handleUnlockConsole does on a correct
-          // password, rather than introducing a second, divergent code path.
+          // Auto-enter this class directly. This account's identity IS the
+          // authorization (a real Firebase login tied to this specific
+          // classId via User Management), so it replicates exactly what
+          // handleUnlockConsole does on a correct password, rather than
+          // introducing a second, divergent code path.
           try {
             const theirClass = await cloudGetClassProfile(record.classId);
             if (theirClass) {
               if (theirClass.approvalStatus === 'PENDING_APPROVAL') {
-                setDeactivatedMessage(`Your class "${theirClass.className}" is still pending approval from the General Superintendent or General Secretary. Please try again once it has been approved.`);
+                setDeactivatedMessage(`Your class "${theirClass.className}" is still pending approval from the General Superintendent or General Secretary. This page will continue automatically the moment it's approved — no need to sign in again.`);
+                // Real-time: the instant a GS/GSec approves this class
+                // (see AdminPortalRoot), this listener fires and lets the
+                // teacher/secretary straight in — no refresh, no re-login.
+                pendingApprovalUnsubRef.current?.();
+                pendingApprovalUnsubRef.current = subscribeToClassProfile(record.classId, (liveClass) => {
+                  if (liveClass && liveClass.approvalStatus !== 'PENDING_APPROVAL') {
+                    pendingApprovalUnsubRef.current?.();
+                    pendingApprovalUnsubRef.current = null;
+                    enterAssignedClass(liveClass);
+                  }
+                });
               } else {
-                await saveClassProfile(theirClass);
-                setClassProfile(theirClass);
-                setIsUnlocked(true);
-                sessionStorage.setItem('gofamint_unlocked', 'true');
-                sessionStorage.setItem('gofamint_unlocked_class_id', theirClass.id);
-                setShowOpeningPage(false);
-                setActiveTab('GRADING_MATRIX');
-                setSelectedWeek(1);
-                await loadClassQuarterData(theirClass.id, selectedQuarter);
+                await enterAssignedClass(theirClass);
               }
             } else {
               setDeactivatedMessage('Your account is assigned to a class that no longer exists. Please contact the General Superintendent or General Secretary.');
@@ -148,6 +170,10 @@ export default function App() {
         console.error('Failed to load user role record:', err);
       }
     })();
+    return () => {
+      pendingApprovalUnsubRef.current?.();
+      pendingApprovalUnsubRef.current = null;
+    };
   }, [cloudUser]);
 
   // Global App States
@@ -223,6 +249,43 @@ export default function App() {
       console.error('Error loading class quarter data:', e);
     }
   };
+
+  // -------------------------------------------------------------------
+  // REAL-TIME CLASS DASHBOARD SYNC (multiple teachers/secretaries on the
+  // same class, same quarter, seeing each other's changes instantly).
+  // This is intentionally scoped to ONLY the class dashboard — the rest of
+  // the app (Admin Portal, Workers Module, etc.) keeps its existing
+  // ~45-second polling sync (see syncWithCloud below), which is unaffected.
+  // Firestore's onSnapshot pushes an update the moment ANY device writes a
+  // matching grade/member/offering — no waiting, no refocusing the tab.
+  // Local IndexedDB is kept warm too (skipCloudMirror=true, since this data
+  // just came FROM the cloud — writing it straight back would be a no-op
+  // round trip), so the cache stays correct if the user goes offline right
+  // after.
+  // -------------------------------------------------------------------
+  useEffect(() => {
+    if (!classProfile?.id || !isUnlocked) return;
+    const classId = classProfile.id;
+
+    const unsubGrades = subscribeToClassGrades(classId, selectedQuarter, (liveGrades) => {
+      setGrades(liveGrades);
+      liveGrades.forEach((g) => putInStore('grades', g, true).catch(() => {}));
+    });
+    const unsubMembers = subscribeToClassMembers(classId, (liveMembers) => {
+      setMembers(liveMembers);
+      liveMembers.forEach((m) => putInStore('members', m, true).catch(() => {}));
+    });
+    const unsubOfferings = subscribeToClassOfferings(classId, selectedQuarter, (liveOfferings) => {
+      setOfferings(liveOfferings);
+      liveOfferings.forEach((o) => putInStore('offerings', o, true).catch(() => {}));
+    });
+
+    return () => {
+      unsubGrades();
+      unsubMembers();
+      unsubOfferings();
+    };
+  }, [classProfile?.id, selectedQuarter, isUnlocked]);
 
   // Re-reads every top-level data slice from local IndexedDB into React state.
   // Used both on first load and after pulling fresh data down from Cloud
