@@ -50,8 +50,10 @@ import {
   approveClassById,
   addDepartmentToYear,
   updateDepartmentNameInYear,
-  deleteDepartmentFromYear
+  deleteDepartmentFromYear,
+  putInStore
 } from '../../db/indexedDB';
+import { subscribeToCollection } from '../../services/firestoreDatabase';
 import { GeneralSuperintendentView } from './GeneralSuperintendentView';
 import { CloudUserManagementPanel } from './CloudUserManagementPanel';
 import { GeneralSecretaryView } from './GeneralSecretaryView';
@@ -141,25 +143,9 @@ export const AdminPortalRoot: React.FC<AdminPortalRootProps> = ({
       const year = await getSundaySchoolYear();
       const classes = await getAllClassesDirectory();
 
-      setAdminProfiles(profiles);
+      applyAdminProfiles(profiles);
       setSundaySchoolYear(year);
       setAllClasses(classes);
-
-      const isGS = profiles.some(p => p.roleType === 'GENERAL_SUPERINTENDENT');
-      const isGSec = profiles.some(p => p.roleType === 'GENERAL_SECRETARY');
-
-      if (!isGS || !isGSec) {
-        setAuthMode('CLAIM_SPOT');
-        if (!isGS) {
-          setClaimingRole('GENERAL_SUPERINTENDENT');
-        } else if (!isGSec) {
-          setClaimingRole('GENERAL_SECRETARY');
-        }
-      } else {
-        if (authMode === 'CLAIM_SPOT') {
-          setAuthMode('EXISTING_PROFILE');
-        }
-      }
     } catch (err) {
       console.error('Failed to load admin data:', err);
     } finally {
@@ -167,8 +153,51 @@ export const AdminPortalRoot: React.FC<AdminPortalRootProps> = ({
     }
   };
 
+  // Shared by the initial local-cache load above AND the real-time
+  // `adminProfiles` listener below, so "does GS/GSec still need to claim
+  // their office" is always evaluated the same way regardless of source.
+  const applyAdminProfiles = (profiles: AdminProfile[]) => {
+    setAdminProfiles(profiles);
+    const isGS = profiles.some(p => p.roleType === 'GENERAL_SUPERINTENDENT');
+    const isGSec = profiles.some(p => p.roleType === 'GENERAL_SECRETARY');
+
+    if (!isGS || !isGSec) {
+      setAuthMode('CLAIM_SPOT');
+      if (!isGS) {
+        setClaimingRole('GENERAL_SUPERINTENDENT');
+      } else if (!isGSec) {
+        setClaimingRole('GENERAL_SECRETARY');
+      }
+    } else {
+      setAuthMode((prev) => (prev === 'CLAIM_SPOT' ? 'EXISTING_PROFILE' : prev));
+    }
+  };
+
   useEffect(() => {
     refreshAdminData();
+  }, []);
+
+  // -------------------------------------------------------------------
+  // REAL-TIME "NEEDS YOUR APPROVAL" SYNC — a class registering (pending
+  // GS/GSec approval) or an officer claiming a role (pending isApproved)
+  // now appears on this screen within about a second, on whichever
+  // admin device happens to be open, instead of only refreshing after a
+  // manual action or a page reload. Local cache is kept warm too
+  // (skipCloudMirror=true — this data just came FROM the cloud).
+  // -------------------------------------------------------------------
+  useEffect(() => {
+    const unsubClasses = subscribeToCollection<ClassProfile>('classes', (liveClasses) => {
+      setAllClasses(liveClasses);
+      liveClasses.forEach((c) => putInStore('allClasses', c, true).catch(() => {}));
+    });
+    const unsubProfiles = subscribeToCollection<AdminProfile>('adminProfiles', (liveProfiles) => {
+      applyAdminProfiles(liveProfiles);
+      liveProfiles.forEach((p) => putInStore('adminProfiles', p, true).catch(() => {}));
+    });
+    return () => {
+      unsubClasses();
+      unsubProfiles();
+    };
   }, []);
 
   const gsProfile = adminProfiles.find(p => p.roleType === 'GENERAL_SUPERINTENDENT');

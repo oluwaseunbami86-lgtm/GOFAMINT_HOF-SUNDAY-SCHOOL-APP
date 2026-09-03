@@ -211,6 +211,32 @@ export function subscribeToClassMembers(
   });
 }
 
+export function subscribeToClassOfferings(
+  classId: string,
+  quarterNumber: QuarterNumber,
+  onUpdate: (offerings: WeeklyOfferingRecord[]) => void
+): Unsubscribe {
+  const colRef = collection(db, 'offerings');
+  const q = query(
+    colRef,
+    where('classId', '==', classId),
+    where('quarterNumber', '==', quarterNumber)
+  );
+  return onSnapshot(q, (snapshot) => {
+    const items = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as WeeklyOfferingRecord));
+    onUpdate(items);
+  });
+}
+
+export function subscribeToClassProfile(
+  classId: string,
+  onUpdate: (profile: ClassProfile | null) => void
+): Unsubscribe {
+  return onSnapshot(doc(db, 'classes', classId), (snap) => {
+    onUpdate(snap.exists() ? ({ id: snap.id, ...snap.data() } as ClassProfile) : null);
+  });
+}
+
 // -------------------------------------------------------------
 // CLOUD FIRESTORE HIGH-LEVEL ENTITY ACCESSORS
 // -------------------------------------------------------------
