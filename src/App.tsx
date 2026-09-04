@@ -71,6 +71,8 @@ import { AdminPortalRoot } from './components/AdminPortal/AdminPortalRoot';
 import { WorkersModuleView } from './components/WorkersModule/WorkersModuleView';
 import { QuarterTransitionModal } from './components/QuarterTransitionModal';
 import { CloudLoginGate } from './components/CloudLoginGate';
+import { InactivityLockScreen } from './components/InactivityLockScreen';
+import { useInactivityLock } from './hooks/useInactivityLock';
 import { watchAuthState, signOutUser } from './services/authService';
 import type { User } from 'firebase/auth';
 
@@ -86,6 +88,10 @@ export default function App() {
     });
     return unsubscribe;
   }, []);
+
+  // Inactivity lock — a visual-only gate, independent of the class-password
+  // unlock flow below. Only engages once actually signed in.
+  const { isLocked, unlock } = useInactivityLock(!!cloudUser);
 
   // Role-based routing for accounts created through User Management (i.e.
   // with a `users/{uid}` Firestore doc). This is purely ADDITIVE: any
@@ -1003,6 +1009,13 @@ export default function App() {
         <p className="text-xs text-blue-200 mt-2 max-w-xs">{deactivatedMessage}</p>
       </div>
     );
+  }
+
+  // Inactivity lock takes over the screen without touching cloudUser,
+  // classProfile, isUnlocked, or any loaded data underneath — it's purely
+  // a visual gate rendered instead of whatever would otherwise show below.
+  if (isLocked && cloudUser) {
+    return <InactivityLockScreen uid={cloudUser.uid} onUnlock={unlock} />;
   }
 
   if (isInitializing) {

@@ -1,5 +1,14 @@
 @import "tailwindcss";
 
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20%, 60% { transform: translateX(-8px); }
+  40%, 80% { transform: translateX(8px); }
+}
+.animate-shake-once {
+  animation: shake 0.4s ease-in-out;
+}
+
 /* Ensure form controls on light backgrounds default to high-contrast deep blue typing text (#0f2b59) */
 input:not([class*="text-white"]):not([class*="text-amber-"]):not([class*="text-emerald-"]):not([class*="text-red-"]),
 textarea:not([class*="text-white"]):not([class*="text-amber-"]):not([class*="text-emerald-"]):not([class*="text-red-"]),
