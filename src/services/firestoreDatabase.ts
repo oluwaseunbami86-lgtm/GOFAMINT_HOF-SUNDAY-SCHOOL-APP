@@ -159,6 +159,28 @@ export async function saveBatchDocuments<T extends { id: string }>(
   }
 }
 
+/**
+ * Deletes many documents from a single collection in as few batched round-trips
+ * as possible (Firestore allows up to 500 writes per batch). Used for admin
+ * bulk-deletion tools (e.g. "Delete Selected" / "Delete All Workers") so a
+ * multi-select or wipe-the-directory action is one atomic-per-chunk operation
+ * against the central database rather than N separate round-trips.
+ */
+export async function removeBatchDocuments(collectionName: string, ids: string[]): Promise<void> {
+  if (!ids || ids.length === 0) return;
+  const chunkSize = 450;
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    const batch = writeBatch(db);
+    for (const id of chunk) {
+      if (id) {
+        batch.delete(doc(db, collectionName, id));
+      }
+    }
+    await batch.commit();
+  }
+}
+
 // -------------------------------------------------------------
 // REAL-TIME FIRESTORE SUBSCRIPTIONS (MULTI-USER COLLABORATION)
 // -------------------------------------------------------------
@@ -281,6 +303,7 @@ export const cloudGetAllWorkers = () => fetchCollection<WorkerProfile>('workers'
 export const cloudSaveWorker = (worker: WorkerProfile) => saveDocument<WorkerProfile>('workers', worker);
 export const cloudSaveBulkWorkers = (workers: WorkerProfile[]) => saveBatchDocuments<WorkerProfile>('workers', workers);
 export const cloudDeleteWorker = (workerId: string) => removeDocument('workers', workerId);
+export const cloudDeleteBulkWorkers = (workerIds: string[]) => removeBatchDocuments('workers', workerIds);
 
 export const cloudGetAllWorkerAttendance = () => fetchCollection<WorkerAttendanceRecord>('workerAttendance');
 export const cloudSaveWorkerAttendance = (att: WorkerAttendanceRecord) => saveDocument<WorkerAttendanceRecord>('workerAttendance', att);

@@ -1,11 +1,16 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { WorkerProfile, WorkerCategoryDef } from '../../types';
 import { 
   Search, Plus, Upload, Filter, QrCode, Phone, MessageSquare, 
   MapPin, Edit, Trash2, CheckCircle2, XCircle, Printer, Sparkles,
   Users, Check, ExternalLink, ChevronRight, Download, BookOpen, Tag, Hash,
-  Archive, ArchiveRestore, AlertTriangle, RefreshCw
+  Archive, ArchiveRestore, AlertTriangle, RefreshCw, ShieldAlert, Loader2
 } from 'lucide-react';
+
+export interface BulkWorkerDeleteResult {
+  succeeded: string[];
+  failed: { id: string; error: string }[];
+}
 
 interface WorkersDirectoryViewProps {
   workers: WorkerProfile[];
@@ -14,12 +19,16 @@ interface WorkersDirectoryViewProps {
   onAddWorker: () => void;
   onBulkImport: () => void;
   onEditWorker: (worker: WorkerProfile) => void;
-  onDeleteWorker: (id: string) => void;
+  onDeleteWorker: (id: string) => Promise<void>;
   onSaveWorkerProfile?: (worker: WorkerProfile) => Promise<void>;
   onViewQrPass: (worker: WorkerProfile) => void;
   onQuickClockIn: (worker: WorkerProfile) => void;
   onNavigateToTab: (tab: any) => void;
+  onBulkDeleteWorkers?: (ids: string[]) => Promise<BulkWorkerDeleteResult>;
+  onDeleteAllWorkers?: () => Promise<{ deletedCount: number }>;
 }
+
+const DELETE_ALL_CONFIRM_PHRASE = 'DELETE ALL WORKERS';
 
 export const WorkersDirectoryView: React.FC<WorkersDirectoryViewProps> = ({
   workers,
@@ -32,19 +41,36 @@ export const WorkersDirectoryView: React.FC<WorkersDirectoryViewProps> = ({
   onSaveWorkerProfile,
   onViewQrPass,
   onQuickClockIn,
-  onNavigateToTab
+  onNavigateToTab,
+  onBulkDeleteWorkers,
+  onDeleteAllWorkers
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedDept, setSelectedDept] = useState<string>('ALL');
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
   const [selectedStatus, setSelectedStatus] = useState<string>('ALL');
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [isDeletingOne, setIsDeletingOne] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   // Archive & Restore Modals
   const [archiveModalWorker, setArchiveModalWorker] = useState<WorkerProfile | null>(null);
   const [archiveReason, setArchiveReason] = useState('Relocated / Moved to new city');
   const [restoreConfirmWorker, setRestoreConfirmWorker] = useState<WorkerProfile | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+
+  // Multi-select state for "Delete Selected"
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false);
+  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
+  const [bulkDeleteError, setBulkDeleteError] = useState<string | null>(null);
+  const [bulkDeleteNotice, setBulkDeleteNotice] = useState<string | null>(null);
+
+  // Danger Zone — Delete All Workers
+  const [showDeleteAllModal, setShowDeleteAllModal] = useState(false);
+  const [deleteAllTypedText, setDeleteAllTypedText] = useState('');
+  const [isDeletingAll, setIsDeletingAll] = useState(false);
+  const [deleteAllError, setDeleteAllError] = useState<string | null>(null);
 
   // Filtered workers
   const filteredWorkers = useMemo(() => {
@@ -70,6 +96,75 @@ export const WorkersDirectoryView: React.FC<WorkersDirectoryViewProps> = ({
       return matchesSearch && matchesDept && matchesCategory && matchesStatus;
     });
   }, [workers, searchQuery, selectedDept, selectedCategory, selectedStatus]);
+
+  // Prune the selection whenever the underlying worker list changes (e.g.
+  // after a delete completes, or a worker is filtered out) so we never try to
+  // act on an id that no longer exists.
+  useEffect(() => {
+    setSelectedIds(prev => {
+      const validIds = new Set(workers.map(w => w.id));
+      let changed = false;
+      const next = new Set<string>();
+      prev.forEach(id => {
+        if (validIds.has(id)) next.add(id);
+        else changed = true;
+      });
+      return changed ? next : prev;
+    });
+  }, [workers]);
+
+  const toggleSelectOne = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAllFiltered = (checked: boolean) => {
+    setSelectedIds(checked ? new Set(filteredWorkers.map(w => w.id)) : new Set());
+  };
+
+  const handleConfirmBulkDelete = async () => {
+    if (!onBulkDeleteWorkers || selectedIds.size === 0) return;
+    setIsBulkDeleting(true);
+    setBulkDeleteError(null);
+    try {
+      const idsToDelete = Array.from(selectedIds);
+      const result = await onBulkDeleteWorkers(idsToDelete);
+      setSelectedIds(new Set());
+      setShowBulkDeleteConfirm(false);
+      if (result.failed.length > 0) {
+        setBulkDeleteError(
+          `${result.succeeded.length} worker(s) deleted. ${result.failed.length} could not be removed from the central database: ${result.failed.map(f => f.error).join('; ')}`
+        );
+      } else {
+        setBulkDeleteNotice(`${result.succeeded.length} worker(s) deleted successfully.`);
+        setTimeout(() => setBulkDeleteNotice(null), 4000);
+      }
+    } catch (err: any) {
+      setBulkDeleteError(err?.message || 'Unable to delete the selected workers. Please try again.');
+    } finally {
+      setIsBulkDeleting(false);
+    }
+  };
+
+  const handleConfirmDeleteAll = async () => {
+    if (!onDeleteAllWorkers || deleteAllTypedText.trim() !== DELETE_ALL_CONFIRM_PHRASE) return;
+    setIsDeletingAll(true);
+    setDeleteAllError(null);
+    try {
+      await onDeleteAllWorkers();
+      setSelectedIds(new Set());
+      setShowDeleteAllModal(false);
+      setDeleteAllTypedText('');
+    } catch (err: any) {
+      setDeleteAllError(err?.message || 'Unable to delete all workers. Please try again.');
+    } finally {
+      setIsDeletingAll(false);
+    }
+  };
 
   // Statistics
   const activeCount = workers.filter(w => w.status === 'ACTIVE').length;
@@ -363,6 +458,37 @@ export const WorkersDirectoryView: React.FC<WorkersDirectoryViewProps> = ({
         )}
       </div>
 
+      {/* Bulk Selection Action Bar */}
+      {onBulkDeleteWorkers && selectedIds.size > 0 && (
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5 shadow-sm flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2 text-xs text-white font-bold">
+            <CheckCircle2 className="w-4 h-4 text-amber-300" />
+            <span>{selectedIds.size} worker{selectedIds.size === 1 ? '' : 's'} selected</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-bold transition"
+            >
+              Clear Selection
+            </button>
+            <button
+              onClick={() => { setBulkDeleteError(null); setShowBulkDeleteConfirm(true); }}
+              className="px-3.5 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-lg text-xs font-black transition flex items-center gap-1.5"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Delete Selected ({selectedIds.size})</span>
+            </button>
+          </div>
+        </div>
+      )}
+      {bulkDeleteNotice && (
+        <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs font-bold text-emerald-800 flex items-center gap-2">
+          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+          <span>{bulkDeleteNotice}</span>
+        </div>
+      )}
+
       {/* Workers Table */}
       <div className="bg-white border border-slate-200 rounded-2xl shadow-xs overflow-hidden">
         {filteredWorkers.length === 0 ? (
@@ -402,6 +528,17 @@ export const WorkersDirectoryView: React.FC<WorkersDirectoryViewProps> = ({
             <table className="w-full text-left text-xs border-collapse min-w-[980px]">
               <thead className="bg-slate-900 text-amber-300 font-bold uppercase tracking-wider border-b border-slate-800 text-[11px]">
                 <tr>
+                  {onBulkDeleteWorkers && (
+                    <th className="py-3 px-3 text-center w-10">
+                      <input
+                        type="checkbox"
+                        checked={filteredWorkers.length > 0 && filteredWorkers.every(w => selectedIds.has(w.id))}
+                        onChange={e => toggleSelectAllFiltered(e.target.checked)}
+                        className="w-3.5 h-3.5 rounded cursor-pointer accent-amber-400"
+                        title="Select all filtered workers"
+                      />
+                    </th>
+                  )}
                   <th className="py-3 px-3 text-center w-12">S/N</th>
                   <th className="py-3 px-4">Worker Name</th>
                   <th className="py-3 px-3 text-center">Sex</th>
@@ -424,8 +561,20 @@ export const WorkersDirectoryView: React.FC<WorkersDirectoryViewProps> = ({
                     .join('') || 'W';
 
                   return (
-                    <tr key={worker.id} className="hover:bg-slate-50/80 transition group">
+                    <tr key={worker.id} className={`hover:bg-slate-50/80 transition group ${selectedIds.has(worker.id) ? 'bg-amber-50/60' : ''}`}>
                       
+                      {/* Select Checkbox */}
+                      {onBulkDeleteWorkers && (
+                        <td className="py-3 px-3 text-center">
+                          <input
+                            type="checkbox"
+                            checked={selectedIds.has(worker.id)}
+                            onChange={() => toggleSelectOne(worker.id)}
+                            className="w-3.5 h-3.5 rounded cursor-pointer accent-amber-500"
+                          />
+                        </td>
+                      )}
+
                       {/* S/N */}
                       <td className="py-3 px-3 text-center font-mono font-bold text-slate-500 text-[11px]">
                         {worker.sn || index + 1}
@@ -625,6 +774,33 @@ export const WorkersDirectoryView: React.FC<WorkersDirectoryViewProps> = ({
         )}
       </div>
 
+      {/* Danger Zone / Database Management */}
+      {onDeleteAllWorkers && (
+        <div className="bg-rose-50/40 border-2 border-dashed border-rose-300 rounded-2xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <div className="w-10 h-10 rounded-2xl bg-rose-100 text-rose-700 flex items-center justify-center shrink-0">
+              <ShieldAlert className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-sm font-black text-rose-900 uppercase tracking-wide">
+                Danger Zone — Database Management
+              </h3>
+              <p className="text-xs text-rose-800/80 max-w-lg mt-0.5">
+                Permanently wipe the entire Workers Directory (all {workers.length} record{workers.length === 1 ? '' : 's'}) from the central database and every device — useful before uploading a fresh official list. This cannot be undone.
+              </p>
+            </div>
+          </div>
+          <button
+            disabled={workers.length === 0}
+            onClick={() => { setDeleteAllError(null); setDeleteAllTypedText(''); setShowDeleteAllModal(true); }}
+            className="px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-black transition flex items-center gap-2 shadow-sm shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <Trash2 className="w-4 h-4" />
+            <span>Delete All Workers</span>
+          </button>
+        </div>
+      )}
+
       {/* Archive Modal */}
       {archiveModalWorker && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-xs animate-fade-in">
@@ -741,23 +917,128 @@ export const WorkersDirectoryView: React.FC<WorkersDirectoryViewProps> = ({
               Confirm Worker Deletion
             </h3>
             <p className="text-xs text-slate-600 leading-relaxed">
-              Are you sure you want to remove this worker from the Master Directory? Historical attendance records will be retained.
+              Are you sure you want to remove this worker from the Master Directory? This action cannot be undone. Historical attendance records will be retained.
             </p>
+            {deleteError && (
+              <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-lg text-[11px] text-rose-800 font-semibold">
+                {deleteError}
+              </div>
+            )}
             <div className="flex justify-end gap-2 pt-2">
               <button
-                onClick={() => setDeleteConfirmId(null)}
-                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition"
+                disabled={isDeletingOne}
+                onClick={() => { setDeleteConfirmId(null); setDeleteError(null); }}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
-                onClick={() => {
-                  onDeleteWorker(deleteConfirmId);
-                  setDeleteConfirmId(null);
+                disabled={isDeletingOne}
+                onClick={async () => {
+                  setIsDeletingOne(true);
+                  setDeleteError(null);
+                  try {
+                    await onDeleteWorker(deleteConfirmId);
+                    setDeleteConfirmId(null);
+                  } catch (err: any) {
+                    setDeleteError(err?.message || 'Unable to delete this worker. Please try again.');
+                  } finally {
+                    setIsDeletingOne(false);
+                  }
                 }}
-                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold transition"
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold transition disabled:opacity-60 flex items-center gap-2"
               >
-                Delete Worker
+                {isDeletingOne && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>{isDeletingOne ? 'Deleting…' : 'Delete Worker'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Delete ("Delete Selected") Confirmation Modal */}
+      {showBulkDeleteConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl border border-slate-200 space-y-4">
+            <h3 className="text-base font-bold text-slate-900">
+              Delete {selectedIds.size} Selected Worker{selectedIds.size === 1 ? '' : 's'}?
+            </h3>
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Are you sure you want to delete the selected workers? This action cannot be undone. Historical attendance records will be retained.
+            </p>
+            {bulkDeleteError && (
+              <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-lg text-[11px] text-rose-800 font-semibold">
+                {bulkDeleteError}
+              </div>
+            )}
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                disabled={isBulkDeleting}
+                onClick={() => { setShowBulkDeleteConfirm(false); setBulkDeleteError(null); }}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                disabled={isBulkDeleting}
+                onClick={handleConfirmBulkDelete}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold transition disabled:opacity-60 flex items-center gap-2"
+              >
+                {isBulkDeleting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>{isBulkDeleting ? 'Deleting selected workers…' : `Delete ${selectedIds.size} Worker${selectedIds.size === 1 ? '' : 's'}`}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Danger Zone — Delete All Workers Confirmation Modal */}
+      {showDeleteAllModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl p-6 max-w-md w-full shadow-2xl border border-rose-200 space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-rose-100 text-rose-700 flex items-center justify-center shrink-0">
+                <ShieldAlert className="w-5 h-5" />
+              </div>
+              <h3 className="text-base font-black text-slate-900">
+                Delete ALL Workers?
+              </h3>
+            </div>
+            <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-2xl text-xs text-rose-900 leading-relaxed">
+              This will permanently remove <strong>all {workers.length} worker record(s)</strong> from the Master Directory, on this device and on the central database used by every other device. This cannot be undone.
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">
+                Type <span className="font-mono text-rose-700">{DELETE_ALL_CONFIRM_PHRASE}</span> to confirm:
+              </label>
+              <input
+                type="text"
+                value={deleteAllTypedText}
+                onChange={e => setDeleteAllTypedText(e.target.value)}
+                placeholder={DELETE_ALL_CONFIRM_PHRASE}
+                className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded-xl text-xs font-mono font-bold text-slate-900 focus:bg-white focus:ring-2 focus:ring-rose-500 outline-hidden"
+              />
+            </div>
+            {deleteAllError && (
+              <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-lg text-[11px] text-rose-800 font-semibold">
+                {deleteAllError}
+              </div>
+            )}
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                disabled={isDeletingAll}
+                onClick={() => { setShowDeleteAllModal(false); setDeleteAllTypedText(''); setDeleteAllError(null); }}
+                className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                disabled={isDeletingAll || deleteAllTypedText.trim() !== DELETE_ALL_CONFIRM_PHRASE}
+                onClick={handleConfirmDeleteAll}
+                className="px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-black transition disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
+              >
+                {isDeletingAll && <Loader2 className="w-4 h-4 animate-spin" />}
+                <span>{isDeletingAll ? 'Deleting all workers…' : 'Permanently Delete All Workers'}</span>
               </button>
             </div>
           </div>

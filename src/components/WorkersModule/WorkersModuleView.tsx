@@ -13,6 +13,8 @@ import {
   getAllWorkers, 
   saveWorker, 
   deleteWorker, 
+  deleteBulkWorkers,
+  deleteAllWorkers,
   saveBulkWorkers, 
   getAllWorkerAttendance, 
   recordWorkerAttendance, 
@@ -348,6 +350,18 @@ export const WorkersModuleView: React.FC<WorkersModuleViewProps> = ({
   const handleDeleteWorker = async (id: string) => {
     await deleteWorker(id);
     await refreshAllData();
+  };
+
+  const handleBulkDeleteWorkers = async (ids: string[]) => {
+    const result = await deleteBulkWorkers(ids);
+    await refreshAllData();
+    return result;
+  };
+
+  const handleDeleteAllWorkers = async () => {
+    const result = await deleteAllWorkers();
+    await refreshAllData();
+    return result;
   };
 
   const handleSaveBulkWorkers = async (newWorkers: WorkerProfile[]) => {
@@ -951,6 +965,8 @@ export const WorkersModuleView: React.FC<WorkersModuleViewProps> = ({
                   setActiveTab('SUNDAY_CLOCK_IN');
                 }}
                 onNavigateToTab={setActiveTab}
+                onBulkDeleteWorkers={handleBulkDeleteWorkers}
+                onDeleteAllWorkers={handleDeleteAllWorkers}
               />
             )}
 
