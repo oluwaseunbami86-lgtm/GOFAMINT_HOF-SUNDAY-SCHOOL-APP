@@ -303,6 +303,29 @@ export async function hydrateLocalFromCloud(): Promise<{ ok: boolean; error?: st
   if (isHydrating) return { ok: true };
   isHydrating = true;
   try {
+    // Guard against clobbering local writes that are still queued for retry
+    // (e.g. this device is offline, or was offline a moment ago). Without
+    // this, a hydration pass reading the still-stale cloud copy would
+    // overwrite a perfectly good local edit/deletion with old data — the same
+    // class of bug as the one this whole pipeline was built to fix, just
+    // triggered by a slow/failed push instead of an abandoned one. Every
+    // pending failure already carries its own collection + doc id + (for
+    // saves) the exact payload that failed to reach the cloud, so we can
+    // patch the freshly-fetched cloud snapshot before it overwrites anything.
+    const pendingFailures = await getPendingCloudSyncFailures();
+    const pendingByCollection = new Map<string, { deletedIds: Set<string>; savedRecords: Map<string, any> }>();
+    for (const f of pendingFailures) {
+      if (!pendingByCollection.has(f.collectionName)) {
+        pendingByCollection.set(f.collectionName, { deletedIds: new Set(), savedRecords: new Map() });
+      }
+      const bucket = pendingByCollection.get(f.collectionName)!;
+      if (f.action === 'delete') {
+        bucket.deletedIds.add(f.docId);
+      } else if (f.action === 'save' && f.data) {
+        bucket.savedRecords.set(f.docId, f.data);
+      }
+    }
+
     // Straightforward collections: members, grades, offerings, absenceLogs,
     // referrals, adminProfiles, sundaySchoolYear, workers, workerAttendance,
     // workerPrepAttendance, clockInConfig, workerCategories, specialEvents,
@@ -310,7 +333,14 @@ export async function hydrateLocalFromCloud(): Promise<{ ok: boolean; error?: st
     for (const storeName of DIRECT_REPLACE_STORES) {
       const collectionName = FIRESTORE_STORE_MAP[storeName];
       const cloudItems = await fetchCollection<any>(collectionName);
-      await replaceStoreContents(storeName, cloudItems);
+      const pending = pendingByCollection.get(collectionName);
+      let itemsToStore = cloudItems;
+      if (pending && (pending.deletedIds.size > 0 || pending.savedRecords.size > 0)) {
+        itemsToStore = cloudItems
+          .filter((it: any) => !pending.deletedIds.has(it.id) && !pending.savedRecords.has(it.id))
+          .concat(Array.from(pending.savedRecords.values()));
+      }
+      await replaceStoreContents(storeName, itemsToStore);
     }
 
     // Classes: hydrate the full directory, then refresh whichever class is

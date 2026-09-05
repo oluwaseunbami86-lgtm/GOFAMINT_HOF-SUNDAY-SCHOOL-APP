@@ -30,36 +30,77 @@ export interface CloudSyncFailureRecord {
   lastError?: string;
 }
 
+// Certain Firestore failures are not worth silently retrying forever — e.g. a
+// permission-denied write (the signed-in account genuinely isn't allowed to do
+// this, per firestore.rules) will never succeed no matter how many times we
+// retry it, and queueing it would make the app *look* like it saved while the
+// central database never actually received the change. Network/availability
+// errors, by contrast, are exactly what the retry queue exists for.
+function isRetryableCloudError(err: any): boolean {
+  const code = err?.code || '';
+  return code !== 'permission-denied' && code !== 'unauthenticated';
+}
+
+async function queueCloudSyncFailure(
+  label: string,
+  retryMeta: { collectionName: string; action: 'save' | 'delete'; docId: string; data?: any },
+  err: any
+): Promise<void> {
+  try {
+    const record: CloudSyncFailureRecord = {
+      id: `${retryMeta.collectionName}_${retryMeta.docId}_${retryMeta.action}`,
+      label,
+      collectionName: retryMeta.collectionName,
+      action: retryMeta.action,
+      docId: retryMeta.docId,
+      data: retryMeta.data,
+      failedAt: new Date().toISOString(),
+      lastError: err?.message || String(err)
+    };
+    const db = await getDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction('cloudSyncFailures', 'readwrite');
+      tx.objectStore('cloudSyncFailures').put(record);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (queueErr) {
+    console.warn('[cloud sync] failed to queue retry record:', queueErr);
+  }
+}
+
+// Fire-and-forget mirror to Cloud Firestore. Local (IndexedDB) writes always
+// succeed first so the app keeps working offline; this mirrors the write to
+// Firestore in the background and returns a Promise<void> that always
+// *resolves* (never rejects) once the attempt has settled one way or another —
+// callers that don't care about completion can ignore the returned promise
+// exactly as before, while callers that need to know the cloud write actually
+// landed before proceeding (see `awaitCloud` on putInStore/deleteFromStore) can
+// await it safely without needing a try/catch of their own.
+interface CloudPushResult {
+  ok: boolean;
+  error?: any;
+  retryable?: boolean;
+}
+
 function pushToCloud<T>(
   label: string,
   fn: () => Promise<T>,
   retryMeta?: { collectionName: string; action: 'save' | 'delete'; docId: string; data?: any }
-): void {
-  fn().catch(async (err) => {
-    console.warn(`[cloud sync] ${label} failed:`, err?.message || err);
-    if (!retryMeta) return;
-    try {
-      const record: CloudSyncFailureRecord = {
-        id: `${retryMeta.collectionName}_${retryMeta.docId}_${retryMeta.action}`,
-        label,
-        collectionName: retryMeta.collectionName,
-        action: retryMeta.action,
-        docId: retryMeta.docId,
-        data: retryMeta.data,
-        failedAt: new Date().toISOString(),
-        lastError: err?.message || String(err)
-      };
-      const db = await getDB();
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction('cloudSyncFailures', 'readwrite');
-        tx.objectStore('cloudSyncFailures').put(record);
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error);
-      });
-    } catch (queueErr) {
-      console.warn('[cloud sync] failed to queue retry record:', queueErr);
+): Promise<CloudPushResult> {
+  return fn().then(
+    (): CloudPushResult => ({ ok: true }),
+    async (err): Promise<CloudPushResult> => {
+      console.warn(`[cloud sync] ${label} failed:`, err?.message || err);
+      const retryable = isRetryableCloudError(err);
+      if (retryMeta && retryable) {
+        await queueCloudSyncFailure(label, retryMeta, err);
+      }
+      // Non-retryable (e.g. permission-denied) failures are deliberately NOT
+      // queued — see isRetryableCloudError.
+      return { ok: false, error: err, retryable };
     }
-  });
+  );
 }
 
 import {
@@ -107,6 +148,7 @@ import {
 import {
   saveDocument,
   removeDocument,
+  removeBatchDocuments,
   fetchCollection,
   fetchDocument
 } from '../services/firestoreDatabase';
@@ -279,13 +321,30 @@ export const FIRESTORE_STORE_MAP: Record<string, string> = {
   treasuryExpenditures: 'treasuryExpenditures'
 };
 
-export async function putInStore<T>(storeName: string, value: T, skipCloudMirror = false): Promise<T> {
-  // Mirror to Cloud Firestore asynchronously. `skipCloudMirror` is used when the
-  // value being written just came FROM the cloud (see hydrateLocalFromCloud in
+// `awaitCloud`: when true, this call does not resolve until the Cloud Firestore
+// mirror write has actually settled (succeeded, or definitively failed and been
+// queued for retry) — instead of the previous fire-and-forget behaviour where
+// the function could resolve (and the UI show "saved!") while the network
+// write to Firestore was still in flight. That gap was the root cause of the
+// "edit reverts after refresh" bug: if the tab was refreshed/closed before the
+// in-flight write landed, the write was silently abandoned, and the next
+// periodic hydration pass (hydrateLocalFromCloud in cloudSyncManager.ts) would
+// then overwrite the local edit with the still-stale cloud copy. Kept opt-in
+// (default false) so the many other call sites that intentionally rely on the
+// old instant-return, sync-in-background behaviour are unaffected.
+export async function putInStore<T>(
+  storeName: string,
+  value: T,
+  skipCloudMirror = false,
+  awaitCloud = false
+): Promise<T> {
+  // Mirror to Cloud Firestore. `skipCloudMirror` is used when the value being
+  // written just came FROM the cloud (see hydrateLocalFromCloud in
   // cloudSyncManager.ts) so we don't immediately write it straight back.
   const colName = FIRESTORE_STORE_MAP[storeName];
+  let cloudPushPromise: Promise<CloudPushResult> | null = null;
   if (!skipCloudMirror && colName && (value as any)?.id) {
-    pushToCloud(`${colName}/${(value as any).id}`, () => saveDocument(colName, value as any), {
+    cloudPushPromise = pushToCloud(`${colName}/${(value as any).id}`, () => saveDocument(colName, value as any), {
       collectionName: colName,
       action: 'save',
       docId: (value as any).id,
@@ -293,9 +352,10 @@ export async function putInStore<T>(storeName: string, value: T, skipCloudMirror
     });
   }
 
+  let result: T;
   try {
     const db = await getDB();
-    return new Promise((resolve, reject) => {
+    result = await new Promise<T>((resolve, reject) => {
       const tx = db.transaction(storeName, 'readwrite');
       const store = tx.objectStore(storeName);
       const req = store.put(value);
@@ -315,15 +375,33 @@ export async function putInStore<T>(storeName: string, value: T, skipCloudMirror
     if (idx >= 0) all[idx] = value;
     else all.push(value);
     localStorage.setItem(`gofamint_${storeName}`, JSON.stringify(all));
-    return value;
+    result = value;
   }
+
+  if (awaitCloud && cloudPushPromise) {
+    const cloudResult = await cloudPushPromise;
+    if (!cloudResult.ok && cloudResult.retryable === false) {
+      // Permission-type failure: not queued for retry (it would never succeed),
+      // so the admin needs to know explicitly that this did NOT reach the
+      // central database, even though it is safely saved on this device.
+      const err: any = new Error(
+        `Saved on this device, but the central database rejected the change (${cloudResult.error?.message || 'permission denied'}). It will not be retried automatically.`
+      );
+      err.code = cloudResult.error?.code;
+      err.cloudSyncFailed = true;
+      throw err;
+    }
+  }
+
+  return result;
 }
 
-export async function deleteFromStore(storeName: string, id: string): Promise<void> {
-  // Mirror deletion to Cloud Firestore asynchronously
+export async function deleteFromStore(storeName: string, id: string, skipCloudMirror = false, awaitCloud = false): Promise<void> {
+  // Mirror deletion to Cloud Firestore. See putInStore for what `awaitCloud` guards against.
   const colName = FIRESTORE_STORE_MAP[storeName];
-  if (colName && id) {
-    pushToCloud(`delete ${colName}/${id}`, () => removeDocument(colName, id), {
+  let cloudPushPromise: Promise<CloudPushResult> | null = null;
+  if (!skipCloudMirror && colName && id) {
+    cloudPushPromise = pushToCloud(`delete ${colName}/${id}`, () => removeDocument(colName, id), {
       collectionName: colName,
       action: 'delete',
       docId: id
@@ -352,6 +430,18 @@ export async function deleteFromStore(storeName: string, id: string): Promise<vo
     }
   } catch (e) {
     console.warn(`localStorage delete sync error:`, e);
+  }
+
+  if (awaitCloud && cloudPushPromise) {
+    const cloudResult = await cloudPushPromise;
+    if (!cloudResult.ok && cloudResult.retryable === false) {
+      const err: any = new Error(
+        `Removed on this device, but the central database rejected the deletion (${cloudResult.error?.message || 'permission denied'}). It will not be retried automatically — the record may reappear on other devices until this is resolved.`
+      );
+      err.code = cloudResult.error?.code;
+      err.cloudSyncFailed = true;
+      throw err;
+    }
   }
 }
 
@@ -1689,19 +1779,116 @@ export async function getWorkerByQrToken(token: string): Promise<WorkerProfile |
   return all.find(w => w.qrCodeToken === trimmed || w.id === trimmed || w.phone === trimmed) || null;
 }
 
+// Workers Directory writes always await the Cloud Firestore mirror (see
+// putInStore's `awaitCloud` param) — this is the fix for the "edit reverts
+// after refresh" bug: the save no longer resolves (and the UI no longer shows
+// "saved successfully") until the change has actually reached the central
+// database, so it can never be silently clobbered by a later sync pass.
 export async function saveWorker(worker: WorkerProfile): Promise<WorkerProfile> {
-  return putInStore<WorkerProfile>('workers', worker);
+  return putInStore<WorkerProfile>('workers', worker, false, true);
 }
 
 export async function saveBulkWorkers(workers: WorkerProfile[]): Promise<WorkerProfile[]> {
   for (const w of workers) {
-    await putInStore<WorkerProfile>('workers', w);
+    await putInStore<WorkerProfile>('workers', w, false, true);
   }
   return workers;
 }
 
 export async function deleteWorker(id: string): Promise<void> {
-  await deleteFromStore('workers', id);
+  await deleteFromStore('workers', id, false, true);
+}
+
+export interface BulkWorkerDeleteResult {
+  succeeded: string[];
+  failed: { id: string; error: string }[];
+}
+
+// Deletes several workers at once. Attempts one batched Cloud Firestore delete
+// first (fast, and keeps the "Delete Selected" action feeling atomic); if that
+// fails for a retryable reason (offline, transient network error), every id is
+// queued individually for automatic retry rather than the deletion silently
+// failing to reach the central database. Local records are removed either way
+// so the admin sees the result of their action immediately, exactly as the
+// single-worker delete already behaves.
+export async function deleteBulkWorkers(ids: string[]): Promise<BulkWorkerDeleteResult> {
+  const result: BulkWorkerDeleteResult = { succeeded: [], failed: [] };
+  if (!ids || ids.length === 0) return result;
+
+  let cloudBatchFailed: any = null;
+  try {
+    await removeBatchDocuments('workers', ids);
+  } catch (err: any) {
+    cloudBatchFailed = err;
+  }
+
+  for (const id of ids) {
+    try {
+      if (cloudBatchFailed && isRetryableCloudError(cloudBatchFailed)) {
+        // The shared batch attempt failed for a retryable reason — queue this
+        // specific id for the automatic retry pass, then remove it locally.
+        await queueCloudSyncFailure(`delete workers/${id}`, { collectionName: 'workers', action: 'delete', docId: id }, cloudBatchFailed);
+        await deleteFromStore('workers', id, /* skipCloudMirror */ true);
+      } else if (cloudBatchFailed) {
+        // Non-retryable (e.g. permission-denied): don't touch this record —
+        // it stays in both the local and central database, and the admin is
+        // told exactly which ones could not be removed.
+        result.failed.push({ id, error: cloudBatchFailed?.message || 'Central database rejected the deletion.' });
+        continue;
+      } else {
+        // Cloud batch already succeeded for this id — just clean up locally.
+        await deleteFromStore('workers', id, /* skipCloudMirror */ true);
+      }
+      result.succeeded.push(id);
+    } catch (err: any) {
+      result.failed.push({ id, error: err?.message || String(err) });
+    }
+  }
+
+  return result;
+}
+
+// "Delete All Workers" — a deliberately destructive Danger Zone action. Wipes
+// every worker record from both the central Firestore database and every
+// device's local cache. Only ever called after the UI has already collected
+// an explicit typed "DELETE ALL WORKERS" confirmation from the admin (see
+// WorkersDirectoryView) and the Firestore security rules independently
+// restrict who is actually allowed to perform the delete (General
+// Superintendent — see firestore.rules `match /workers/{workerId}`).
+export async function deleteAllWorkers(): Promise<{ deletedCount: number; cloudError?: string }> {
+  const all = await getAllFromStore<WorkerProfile>('workers');
+  const ids = all.map(w => w.id).filter(Boolean);
+  if (ids.length === 0) return { deletedCount: 0 };
+
+  try {
+    await removeBatchDocuments('workers', ids);
+  } catch (err: any) {
+    if (!isRetryableCloudError(err)) {
+      // Permission-denied: refuse the whole operation rather than wiping the
+      // local directory while the central database still has every record —
+      // that would look like success locally but leave every other device
+      // (and the next hydration pass on THIS device) showing the old data.
+      throw new Error(
+        `The central database rejected this operation (${err?.message || 'permission denied'}). No records were deleted. Only the General Superintendent's account can delete all workers.`
+      );
+    }
+    // Retryable (offline / transient): queue every id for automatic retry,
+    // then proceed with the local wipe below — the admin's intent is to clear
+    // the directory immediately, and the cloud side will reconcile once
+    // connectivity is restored.
+    for (const id of ids) {
+      await queueCloudSyncFailure(`delete workers/${id}`, { collectionName: 'workers', action: 'delete', docId: id }, err);
+    }
+  }
+
+  await replaceStoreContents('workers', []);
+  try {
+    localStorage.removeItem('gofamint_workers');
+  } catch {
+    // non-fatal — localStorage mirror is best-effort
+  }
+
+  return { deletedCount: ids.length };
 }
 
 // Sunday Clock-In Attendance Store
@@ -1718,13 +1905,17 @@ export async function getAllWorkerAttendance(serviceDate?: string): Promise<Work
   }
 }
 
+// Clock-in records also await the Cloud Firestore mirror (see saveWorker above
+// for why) so a Sunday clock-in is guaranteed to have reached the central
+// database — and therefore be visible from another admin's device — by the
+// time the kiosk shows its success confirmation.
 export async function saveWorkerAttendance(record: WorkerAttendanceRecord): Promise<WorkerAttendanceRecord> {
-  return putInStore<WorkerAttendanceRecord>('workerAttendance', record);
+  return putInStore<WorkerAttendanceRecord>('workerAttendance', record, false, true);
 }
 
 export async function saveBulkWorkerAttendance(records: WorkerAttendanceRecord[]): Promise<WorkerAttendanceRecord[]> {
   for (const r of records) {
-    await putInStore<WorkerAttendanceRecord>('workerAttendance', r);
+    await putInStore<WorkerAttendanceRecord>('workerAttendance', r, false, true);
   }
   return records;
 }
