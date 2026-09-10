@@ -582,6 +582,20 @@ Provide:
     "lessons",
   ];
 
+  // Firestore's Admin SDK throws if a document being written contains a raw
+  // JS `undefined` anywhere (a field that was simply never set on the source
+  // document reads back as `undefined`, not `null`). Used when hand-building
+  // new snapshot objects (as opposed to passing through `doc.data()` as-is,
+  // which Firestore itself never returns `undefined` values, so it's always
+  // safe) — see the class/worker/admin-profile snapshots below.
+  function nullifyUndefined<T extends Record<string, any>>(obj: T): T {
+    const result: Record<string, any> = {};
+    for (const key of Object.keys(obj)) {
+      result[key] = obj[key] === undefined ? null : obj[key];
+    }
+    return result as T;
+  }
+
   // Moves every document in a live operational collection into
   // `yearArchives/{yearId}/{collectionName}/{docId}` and only THEN deletes it
   // from the live collection. This is the non-destructive alternative to
@@ -721,28 +735,37 @@ Provide:
       // 1. Preserve: archive the full outgoing year record, plus a snapshot
       // of who currently holds each class and each worker's duty role,
       // before touching anything else.
+      //
+      // `nullifyUndefined` matters here: a field that was simply never set on
+      // a given document (e.g. a worker who was never assigned a class) reads
+      // back from Firestore as JS `undefined`, not `null` or `''`. Embedding
+      // that raw `undefined` into a NEW document below makes the Firestore
+      // Admin SDK reject the entire write with "Cannot use 'undefined' as a
+      // Firestore value" — which is exactly what was killing this reset
+      // partway through, on whichever worker/class/officer happened to have
+      // an unset field. Firestore is fine with `null`, so normalize to that.
       const classesSnapshotDocs = await adminDb.collection("classes").get();
       const classAssignmentsSnapshot = classesSnapshotDocs.docs.map((d) => {
         const c = d.data() as any;
-        return {
+        return nullifyUndefined({
           classId: d.id,
           className: c.className,
           secretaryName: c.secretaryName,
           secretaryPhone: c.secretaryPhone,
           teachers: c.teachers,
-        };
+        });
       });
 
       const workersSnapshotDocs = await adminDb.collection("workers").get();
       const workerAssignmentsSnapshot = workersSnapshotDocs.docs.map((d) => {
         const w = d.data() as any;
-        return {
+        return nullifyUndefined({
           workerId: d.id,
           fullName: w.fullName,
           assignedClass: w.assignedClass,
           duty: w.duty,
           categories: w.categories,
-        };
+        });
       });
 
       // adminProfiles docs ARE the officer's registration for that office
@@ -761,13 +784,14 @@ Provide:
       const adminProfilesSnapshotDocs = await adminDb.collection("adminProfiles").get();
       const adminProfileAssignmentsSnapshot = adminProfilesSnapshotDocs.docs.map((d) => {
         const a = d.data() as any;
-        return {
+        return nullifyUndefined({
           roleType: a.roleType,
           title: a.title,
           profileName: a.profileName,
           username: a.username,
-        };
+        });
       });
+
 
       await adminDb
         .collection("sundaySchoolYearArchive")
