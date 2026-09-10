@@ -59,6 +59,7 @@ import {
   Trophy, Calendar
 } from 'lucide-react';
 import { GofamintLogo } from '../GofamintLogo';
+import { signOutUser } from '../../services/authService';
 
 export type WorkersModuleTab = 
   | 'DIRECTORY' 
@@ -798,6 +799,16 @@ export const WorkersModuleView: React.FC<WorkersModuleViewProps> = ({
                   <span>Portal</span>
                 </button>
               )}
+              <button
+                onClick={async () => {
+                  if (!window.confirm('Log out of this account? You will need to sign in again — with this or a different email — to continue.')) return;
+                  await signOutUser();
+                }}
+                className="p-2 bg-rose-950/60 hover:bg-rose-900 text-rose-200 hover:text-white rounded-xl text-xs transition"
+                title="Sign out of this account entirely (use this to log in with a different email)"
+              >
+                <LogOut className="w-4 h-4" />
+              </button>
             </div>
           </div>
 
@@ -828,6 +839,21 @@ export const WorkersModuleView: React.FC<WorkersModuleViewProps> = ({
                 <span>Return to Portal</span>
               </button>
             )}
+
+            {/* Log Out — ends the underlying Firebase session entirely, unlike
+                "Lock Directorate" above (which only clears this module's local
+                password gate). Use this to sign in with a different email. */}
+            <button
+              onClick={async () => {
+                if (!window.confirm('Log out of this account? You will need to sign in again — with this or a different email — to continue.')) return;
+                await signOutUser();
+              }}
+              className="px-3 py-1.5 bg-rose-950/60 hover:bg-rose-900 text-rose-200 hover:text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 border border-rose-800/60 cursor-pointer"
+              title="Sign out of this account entirely (use this to log in with a different email)"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Log Out</span>
+            </button>
           </div>
 
         </div>

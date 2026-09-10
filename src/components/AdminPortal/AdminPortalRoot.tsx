@@ -38,6 +38,7 @@ import {
   ClassProfile
 } from '../../types';
 import { PERMITTED_ADMIN_IDS } from '../../data/mockQuarterLessons';
+import { signOutUser } from '../../services/authService';
 import {
   getAllAdminProfiles,
   saveAdminProfile,
@@ -514,6 +515,22 @@ export const AdminPortalRoot: React.FC<AdminPortalRootProps> = ({
               >
                 <ArrowLeft className="w-3.5 h-3.5" />
                 <span>Portal Selection</span>
+              </button>
+
+              {/* Log Out — ends the underlying Firebase session entirely, unlike
+                  "Switch Profile" above (which only clears the locally-claimed
+                  office within the SAME signed-in account). Use this to sign in
+                  with a different email/account. */}
+              <button
+                onClick={async () => {
+                  if (!window.confirm('Log out of this account? You will need to sign in again — with this or a different email — to continue.')) return;
+                  await signOutUser();
+                }}
+                className="px-3 py-1.5 bg-rose-950/60 hover:bg-rose-900 text-rose-200 hover:text-white rounded-xl text-xs font-bold flex items-center gap-1.5 border border-rose-800/60 transition cursor-pointer"
+                title="Sign out of this account entirely (use this to log in with a different email)"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Log Out</span>
               </button>
             </div>
 
