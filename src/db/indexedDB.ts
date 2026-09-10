@@ -2092,9 +2092,16 @@ export async function getSundaySchoolYear(): Promise<SundaySchoolYear> {
   return INITIAL_SUNDAY_SCHOOL_YEAR;
 }
 
+// The year record (which holds the custom departments list, quarters, etc.)
+// awaits the Cloud Firestore mirror for the same reason saveWorker does: a
+// department added via "+ Add Dept" was previously written fire-and-forget,
+// so if the admin closed/refreshed the page (or the periodic hydration pass
+// ran) before that write actually reached Firestore, it was silently
+// abandoned and the next sync pulled the old departments list back down,
+// making the addition look like it "didn't save."
 export async function saveSundaySchoolYear(year: SundaySchoolYear): Promise<SundaySchoolYear> {
   const updated = { ...year, updatedAt: new Date().toISOString() };
-  await putInStore('sundaySchoolYear', updated);
+  await putInStore('sundaySchoolYear', updated, false, true);
   return updated;
 }
 
